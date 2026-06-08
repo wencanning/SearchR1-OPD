@@ -1,0 +1,19 @@
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+export TRAIN_DATA=${TRAIN_DATA:-data/search_sft/train.parquet}
+export VAL_DATA=${VAL_DATA:-data/search_sft/val.parquet}
+export BASE_MODEL=${BASE_MODEL:-Qwen/Qwen2.5-0.5B-Instruct}
+export EXPERIMENT_NAME=${EXPERIMENT_NAME:-search-r1-sft-qwen2.5-0.5b-instruct}
+export NPROC_PER_NODE=${NPROC_PER_NODE:-1}
+
+torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}" -m verl.trainer.fsdp_sft_trainer \
+    data.train_files="${TRAIN_DATA}" \
+    data.val_files="${VAL_DATA}" \
+    data.prompt_key=prompt \
+    data.response_key=response \
+    data.max_length=4096 \
+    model.partial_pretrain="${BASE_MODEL}" \
+    model.enable_gradient_checkpointing=true \
+    trainer.project_name=search-r1-sft \
+    trainer.experiment_name="${EXPERIMENT_NAME}" \
+    trainer.default_local_dir="checkpoints/search_r1_sft/${EXPERIMENT_NAME}" \
+    trainer.default_hdfs_dir=null
