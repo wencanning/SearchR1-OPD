@@ -50,3 +50,40 @@ BASE_MODEL=Qwen/Qwen2.5-0.5B-Instruct \
 NPROC_PER_NODE=8 \
 bash train_sft.sh
 ```
+
+## Teacher rollout
+
+To distill from a deployed Search-R1 teacher served by vLLM, first generate raw trajectories:
+
+```bash
+.venv/bin/python scripts/sft/rollout_teacher_vllm.py \
+  --base-url http://127.0.0.1:8001/v1 \
+  --model PeterJinGo/SearchR1-nq_hotpotqa_train-qwen2.5-3b-it-em-grpo-v0.2 \
+  --tokenizer Qwen/Qwen2.5-3B-Instruct \
+  --retriever-url http://127.0.0.1:8000/retrieve \
+  --data-sources nq,hotpotqa \
+  --samples-per-source 5000 \
+  --concurrency 32 \
+  --output-dir data/teacher_rollout
+```
+
+This writes:
+
+- `raw_rollouts.jsonl`: every attempted trajectory
+- `accepted_rollouts.jsonl`: trajectories that pass the built-in quality filter
+- `summary.json`: aggregate counts
+
+Each record stores the original prompt, full response trajectory, per-turn search logs, quality metrics, and stop reason. Concurrency is per-trajectory: each sample runs sequential search turns, while multiple samples roll out in parallel.
+
+## Raw to parquet
+
+Convert the filtered rollout records into SFT parquet files:
+
+```bash
+.venv/bin/python scripts/sft/raw_to_parquet.py \
+  --input-jsonl data/teacher_rollout/accepted_rollouts.jsonl \
+  --output-dir data/search_sft \
+  --require-quality-pass
+```
+
+The conversion step deduplicates by question, keeps the highest-scoring trajectory, and writes `train.parquet` plus `val.parquet`.
