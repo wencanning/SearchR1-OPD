@@ -75,6 +75,26 @@ This writes:
 
 Each record stores the original prompt, full response trajectory, per-turn search logs, quality metrics, and stop reason. Concurrency is per-trajectory: each sample runs sequential search turns, while multiple samples roll out in parallel.
 
+For a one-command pipeline from teacher rollout to parquet:
+
+```bash
+bash scripts/sft/collect_cold_start_data.sh
+```
+
+Common overrides:
+
+```bash
+TEACHER_BASE_URL=http://127.0.0.1:8001/v1 \
+TEACHER_MODEL=PeterJinGo/SearchR1-nq_hotpotqa_train-qwen2.5-3b-it-em-grpo-v0.2 \
+RETRIEVER_URL=http://127.0.0.1:8000/retrieve \
+DATA_SOURCES=nq,hotpotqa \
+SAMPLES_PER_SOURCE=5000 \
+CONCURRENCY=32 \
+ROLLOUT_DIR=data/teacher_rollout \
+PARQUET_DIR=data/search_sft \
+bash scripts/sft/collect_cold_start_data.sh
+```
+
 ## Raw to parquet
 
 Convert the filtered rollout records into SFT parquet files:
