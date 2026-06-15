@@ -149,6 +149,39 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
                                                                         index=index)
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
+    elif adv_estimator == 'opd':
+        responses = data.batch['responses']
+        response_length = responses.size(-1)
+        response_mask = data.batch['loss_mask'] if 'loss_mask' in data.batch else \
+            data.batch['attention_mask'][:, -response_length:]
+        opd_config = data.meta_info['opd_config']
+        opd_advantages, _ = core_algos.compute_opd_advantage(
+            old_log_prob=data.batch['old_log_probs'],
+            teacher_log_prob=data.batch['ref_log_prob'],
+            eos_mask=response_mask,
+            advantage_mode=opd_config['advantage_mode'],
+            normalize=opd_config['normalize'],
+            clip_value=opd_config['clip_value'],
+        )
+        grpo_advantages = torch.zeros_like(opd_advantages)
+        grpo_reward_coef = opd_config.get('grpo_reward_coef', 0.0)
+        distillation_coef = opd_config.get('distillation_coef', 1.0)
+        if grpo_reward_coef != 0:
+            grpo_advantages, _ = core_algos.compute_grpo_outcome_advantage(
+                token_level_rewards=data.batch['token_level_rewards'],
+                eos_mask=response_mask,
+                index=data.non_tensor_batch['uid'],
+            )
+
+        advantages = (
+            distillation_coef * opd_advantages
+            + grpo_reward_coef * grpo_advantages
+        )
+        returns = advantages
+        data.batch['opd_advantages'] = opd_advantages
+        data.batch['grpo_advantages'] = grpo_advantages
+        data.batch['advantages'] = advantages
+        data.batch['returns'] = returns
     else:
         raise NotImplementedError
     return data
@@ -188,6 +221,7 @@ def compute_data_metrics(batch, use_critic=True):
 
     prompt_mask = batch.batch['attention_mask'][:, :-max_response_length].bool()
     response_mask = batch.batch['attention_mask'][:, -max_response_length:].bool()
+    advantage_mask = batch.batch['loss_mask'].bool() if 'loss_mask' in batch.batch else response_mask
 
     max_prompt_length = prompt_mask.size(-1)
 
@@ -195,12 +229,12 @@ def compute_data_metrics(batch, use_critic=True):
     prompt_length = response_info['prompt_length']
     response_length = response_info['response_length']
 
-    valid_adv = torch.masked_select(advantages, response_mask)
-    valid_returns = torch.masked_select(returns, response_mask)
+    valid_adv = torch.masked_select(advantages, advantage_mask)
+    valid_returns = torch.masked_select(returns, advantage_mask)
 
     if use_critic:
         values = batch.batch['values']
-        valid_values = torch.masked_select(values, response_mask)
+        valid_values = torch.masked_select(values, advantage_mask)
         return_diff_var = torch.var(valid_returns - valid_values)
         return_var = torch.var(valid_returns)
 
@@ -342,8 +376,19 @@ class RayPPOTrainer(object):
         self.role_worker_mapping = role_worker_mapping
         self.resource_pool_manager = resource_pool_manager
         self.use_reference_policy = Role.RefPolicy in role_worker_mapping
-        self.use_rm = Role.RewardModel in role_worker_mapping
+        self.use_opd = config.algorithm.adv_estimator == 'opd'
+        self.use_rm = Role.RewardModel in role_worker_mapping and not self.use_opd
         self.ray_worker_group_cls = ray_worker_group_cls
+
+        if self.use_opd:
+            assert self.use_reference_policy, 'OPD requires a teacher/reference policy'
+            assert not config.actor_rollout_ref.actor.use_kl_loss, \
+                'OPD uses the teacher signal directly; actor.use_kl_loss must be false'
+            assert not config.do_search or config.actor_rollout_ref.actor.state_masking, \
+                'Search OPD requires actor.state_masking=true to exclude observation tokens'
+            if config.algorithm.opd.grpo_reward_coef != 0:
+                group_size = config.actor_rollout_ref.rollout.n_agent * config.actor_rollout_ref.rollout.n
+                assert group_size > 1, 'OPD + GRPO reward requires more than one rollout per prompt'
 
         # define KL control
         if self.use_reference_policy:
@@ -570,7 +615,7 @@ class RayPPOTrainer(object):
             self.resource_pool_to_cls[resource_pool]['critic'] = critic_cls
             self.use_critic = True
             
-        elif self.config.algorithm.adv_estimator == 'grpo':
+        elif self.config.algorithm.adv_estimator in ['grpo', 'opd']:
             self.use_critic = False
         else:
             raise NotImplementedError
@@ -699,6 +744,13 @@ class RayPPOTrainer(object):
                 timing_raw = {}
 
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
+                if self.config.do_search:
+                    # Keep all rollouts from the same prompt in one GRPO group.
+                    # Dataset indices are not globally unique across merged sources.
+                    batch.non_tensor_batch['uid'] = np.array(
+                        [str(uuid.uuid4()) for _ in range(len(batch.batch))],
+                        dtype=object,
+                    )
                 batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n_agent, interleave=True)
 
                 # pop those keys for generation
@@ -739,10 +791,6 @@ class RayPPOTrainer(object):
                             output = self.actor_rollout_wg.compute_log_prob(final_gen_batch_output)
                             final_gen_batch_output = final_gen_batch_output.union(output)
 
-                        # batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
-                        #                                         dtype=object)
-                        batch.non_tensor_batch['uid'] = batch.non_tensor_batch['index'].copy()
-                                            
                         # repeat to align with repeated responses in rollout
                         batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                         batch = batch.union(final_gen_batch_output)
@@ -775,27 +823,50 @@ class RayPPOTrainer(object):
                             values = self.critic_wg.compute_values(batch)
                             batch = batch.union(values)
 
+                    if self.use_opd and self.config.do_search and self.config.actor_rollout_ref.actor.state_masking:
+                        batch, metrics = self._create_loss_mask(batch, metrics)
+
                     with _timer('adv', timing_raw):
-                        # compute scores. Support both model and function-based.
-                        # We first compute the scores using reward model. Then, we call reward_fn to combine
-                        # the results from reward model and rule-based results.
-                        if self.use_rm:
-                            # we first compute reward model score
-                            reward_tensor = self.rm_wg.compute_rm_score(batch)
-                            batch = batch.union(reward_tensor)
-
-                        # we combine with rule-based rm
-                        reward_tensor = self.reward_fn(batch)
-                        batch.batch['token_level_scores'] = reward_tensor
-
-                        # compute rewards. apply_kl_penalty if available
-                        if not self.config.actor_rollout_ref.actor.use_kl_loss:
-                            batch, kl_metrics = apply_kl_penalty(batch,
-                                                                 kl_ctrl=self.kl_ctrl,
-                                                                 kl_penalty=self.config.algorithm.kl_penalty)
-                            metrics.update(kl_metrics)
+                        if self.use_opd:
+                            response_length = batch.batch['responses'].size(-1)
+                            opd_mask = batch.batch['loss_mask'] if 'loss_mask' in batch.batch else \
+                                batch.batch['attention_mask'][:, -response_length:]
+                            opd_scores = (batch.batch['ref_log_prob'] - batch.batch['old_log_probs']) * opd_mask
+                            if self.config.algorithm.opd.grpo_reward_coef != 0:
+                                reward_tensor = self.reward_fn(batch)
+                                batch.batch['token_level_scores'] = reward_tensor
+                                batch.batch['token_level_rewards'] = reward_tensor
+                            else:
+                                batch.batch['token_level_scores'] = opd_scores
+                                batch.batch['token_level_rewards'] = opd_scores
+                            batch.meta_info['opd_config'] = {
+                                'advantage_mode': self.config.algorithm.opd.advantage_mode,
+                                'normalize': self.config.algorithm.opd.normalize,
+                                'clip_value': self.config.algorithm.opd.clip_value,
+                                'distillation_coef': self.config.algorithm.opd.distillation_coef,
+                                'grpo_reward_coef': self.config.algorithm.opd.grpo_reward_coef,
+                            }
+                            metrics['opd/reverse_kl_k1'] = masked_mean(
+                                batch.batch['old_log_probs'] - batch.batch['ref_log_prob'],
+                                opd_mask,
+                            ).item()
+                            metrics['opd/teacher_advantage'] = masked_mean(opd_scores, opd_mask).item()
                         else:
-                            batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
+                            # compute scores. Support both model and function-based.
+                            if self.use_rm:
+                                reward_tensor = self.rm_wg.compute_rm_score(batch)
+                                batch = batch.union(reward_tensor)
+
+                            reward_tensor = self.reward_fn(batch)
+                            batch.batch['token_level_scores'] = reward_tensor
+
+                            if not self.config.actor_rollout_ref.actor.use_kl_loss:
+                                batch, kl_metrics = apply_kl_penalty(batch,
+                                                                     kl_ctrl=self.kl_ctrl,
+                                                                     kl_penalty=self.config.algorithm.kl_penalty)
+                                metrics.update(kl_metrics)
+                            else:
+                                batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
 
                         # compute advantages, executed on the driver process
                         batch = compute_advantage(batch,
@@ -803,6 +874,16 @@ class RayPPOTrainer(object):
                                                   gamma=self.config.algorithm.gamma,
                                                   lam=self.config.algorithm.lam,
                                                   num_repeat=self.config.actor_rollout_ref.rollout.n)
+                        if self.use_opd:
+                            metrics['opd/distillation_advantage'] = masked_mean(
+                                batch.batch['opd_advantages'], opd_mask
+                            ).item()
+                            metrics['opd/grpo_advantage'] = masked_mean(
+                                batch.batch['grpo_advantages'], opd_mask
+                            ).item()
+                            metrics['opd/combined_advantage'] = masked_mean(
+                                batch.batch['advantages'], opd_mask
+                            ).item()
 
                     # update critic
                     if self.use_critic:
@@ -815,7 +896,8 @@ class RayPPOTrainer(object):
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
                         with _timer('update_actor', timing_raw):
-                            if self.config.do_search and self.config.actor_rollout_ref.actor.state_masking:
+                            if not self.use_opd and self.config.do_search and \
+                                    self.config.actor_rollout_ref.actor.state_masking:
                                 batch, metrics = self._create_loss_mask(batch, metrics)
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])

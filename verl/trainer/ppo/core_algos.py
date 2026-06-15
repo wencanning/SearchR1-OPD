@@ -155,6 +155,41 @@ def compute_grpo_outcome_advantage(token_level_rewards: torch.Tensor,
     return scores, scores
 
 
+def compute_opd_advantage(old_log_prob: torch.Tensor,
+                          teacher_log_prob: torch.Tensor,
+                          eos_mask: torch.Tensor,
+                          advantage_mode: str = 'token',
+                          normalize: bool = False,
+                          clip_value: float = None):
+    """Compute the K1 sampled reverse-KL signal for on-policy distillation.
+
+    The student samples trajectories on-policy and the teacher scores the same
+    tokens. ``teacher_log_prob - old_log_prob`` is a reward whose policy
+    gradient minimizes ``KL(student || teacher)``.
+    """
+    with torch.no_grad():
+        token_advantages = (teacher_log_prob - old_log_prob) * eos_mask
+
+        if advantage_mode == 'token':
+            advantages = token_advantages
+        elif advantage_mode == 'sequence':
+            advantages = torch.flip(
+                torch.cumsum(torch.flip(token_advantages, dims=[-1]), dim=-1),
+                dims=[-1],
+            )
+        else:
+            raise ValueError(f"Unsupported OPD advantage_mode: {advantage_mode}")
+
+        if clip_value is not None:
+            advantages = torch.clamp(advantages, min=-clip_value, max=clip_value)
+        if normalize:
+            advantages = verl_F.masked_whiten(advantages, eos_mask)
+
+        advantages = advantages * eos_mask
+
+    return advantages, advantages
+
+
 def compute_rewards(token_level_scores, old_log_prob, ref_log_prob, kl_ratio):
     kl = old_log_prob - ref_log_prob
     return token_level_scores - kl * kl_ratio

@@ -95,19 +95,54 @@ class LLMGenerationManager:
 
     def _process_next_obs(self, next_obs: List[str]) -> torch.Tensor:
         """Process next observations from environment."""
-        
-        next_obs_ids = self.tokenizer(
-            next_obs, 
-            padding='longest',
-            return_tensors='pt',
-            add_special_tokens=False,  # Prevents adding special tokens
-        )['input_ids']
+        information_start = "<information>"
+        information_end = "</information>"
+        processed_obs_ids = []
 
-        if next_obs_ids.shape[1] > self.config.max_obs_length:
-            print(f"[WARNING] OBSERVATION TOO LONG, CONSIDER CHANGING YOUR CONFIG, {next_obs_ids.shape[1]} & {self.config.max_obs_length}")            
-            next_obs_ids = next_obs_ids[:, :self.config.max_obs_length]
+        for observation in next_obs:
+            observation_ids = self.tokenizer(
+                observation,
+                add_special_tokens=False,
+            )['input_ids']
 
-        return next_obs_ids
+            if len(observation_ids) > self.config.max_obs_length:
+                start_index = observation.find(information_start)
+                end_index = observation.rfind(information_end)
+                if start_index >= 0 and end_index >= start_index + len(information_start):
+                    prefix_ids = self.tokenizer(
+                        observation[:start_index + len(information_start)],
+                        add_special_tokens=False,
+                    )['input_ids']
+                    content_ids = self.tokenizer(
+                        observation[start_index + len(information_start):end_index],
+                        add_special_tokens=False,
+                    )['input_ids']
+                    suffix_ids = self.tokenizer(
+                        observation[end_index:],
+                        add_special_tokens=False,
+                    )['input_ids']
+                    content_length = self.config.max_obs_length - len(prefix_ids) - len(suffix_ids)
+                    if content_length < 0:
+                        raise ValueError(
+                            "max_obs_length is too small to preserve "
+                            "<information> and </information>"
+                        )
+                    observation_ids = prefix_ids + content_ids[:content_length] + suffix_ids
+                else:
+                    observation_ids = observation_ids[:self.config.max_obs_length]
+
+            processed_obs_ids.append(
+                torch.tensor(observation_ids, dtype=torch.long)
+            )
+
+        if not processed_obs_ids:
+            return torch.empty((0, 0), dtype=torch.long)
+
+        return torch.nn.utils.rnn.pad_sequence(
+            processed_obs_ids,
+            batch_first=True,
+            padding_value=self.tokenizer.pad_token_id,
+        )
 
     def _update_rolling_state(self, rollings: DataProto, cur_responses: torch.Tensor, 
                             next_obs_ids: torch.Tensor) -> Dict:

@@ -32,7 +32,10 @@ Built upon [veRL](https://github.com/volcengine/verl), Search-R1 extends the ide
 
 <!-- Through RL (rule-based outcome reward), the 3B **base** LLM (both Qwen2.5-3b-base and Llama3.2-3b-base) develops reasoning and search engine calling abilities all on its own. -->
 
-We support different RL methods (e.g., PPO, GRPO, reinforce), different LLMs (e.g., llama3, Qwen2.5, etc) and different search engines (e.g., local sparse/dense retrievers and online search engines).
+We support different training methods (e.g., PPO, GRPO, reinforce, and
+[On-Policy Distillation](docs/opd.md)), different LLMs (e.g., llama3,
+Qwen2.5, etc) and different search engines (e.g., local sparse/dense retrievers
+and online search engines).
 
 Paper: [link1](https://arxiv.org/pdf/2503.09516), [link2](https://arxiv.org/abs/2505.15117); Model and data: [link](https://huggingface.co/collections/PeterJinGo/search-r1-67d1a021202731cb065740f5); Twitter thread: [link](https://x.com/BowenJin13/status/1895544294473109889); Full experiment log: [prelim](https://wandb.ai/peterjin/Search-R1-open); [v0.1](https://wandb.ai/peterjin/Search-R1-nq_hotpotqa_train); [v0.2](https://wandb.ai/peterjin/Search-R1-v0.2); [v0.3](https://wandb.ai/peterjin/Search-R1-v0.3). Details about these logs and methods can be find [here](https://github.com/PeterGriffinJin/Search-R1/blob/main/docs/experiment_log.md).
 
@@ -56,6 +59,7 @@ Paper: [link1](https://arxiv.org/pdf/2503.09516), [link2](https://arxiv.org/abs/
 - [Quick start](#quick-start)
 - [Preliminary results](#preliminary-results)
 - [Inference](#inference)
+- [On-Policy Distillation](docs/opd.md)
 - [Use your own dataset](#use-your-own-dataset)
 - [Use your own search engine](#use-your-own-search-engine)
 - [Features](#features)
