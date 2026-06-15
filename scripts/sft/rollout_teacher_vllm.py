@@ -32,7 +32,8 @@ def parse_args():
     parser.add_argument("--retriever-url", default="http://127.0.0.1:8000/retrieve")
     parser.add_argument("--data-sources", default="nq,hotpotqa")
     parser.add_argument("--split", default="train")
-    parser.add_argument("--samples-per-source", type=int, default=5000)
+    parser.add_argument("--samples-per-source", default="5000",
+                        help="Samples per data source. A single int (same for all) or comma-separated ints (one per source, matching --data-sources order).")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--output-dir", default="data/teacher_rollout")
     parser.add_argument("--concurrency", type=int, default=32)
@@ -59,13 +60,33 @@ def resolve_split(dataset_dict, requested_split):
     raise ValueError(f"Unable to resolve split for dataset keys: {list(dataset_dict.keys())}")
 
 
-def load_samples(data_sources: Sequence[str], split: str, samples_per_source: int, seed: int) -> List[Dict]:
+def parse_per_source_counts(samples_per_source: str, data_sources: Sequence[str]) -> List[int]:
+    """Parse --samples-per-source into a list of ints, one per data source.
+
+    Accepts a single int (applied to all sources) or a comma-separated list
+    (one per source, same order as --data-sources).
+    """
+    parts = [s.strip() for s in samples_per_source.split(",")]
+    if len(parts) == 1:
+        return [int(parts[0])] * len(data_sources)
+    counts = [int(p) for p in parts]
+    if len(counts) != len(data_sources):
+        raise ValueError(
+            f"--samples-per-source has {len(counts)} values but "
+            f"--data-sources has {len(data_sources)} ({data_sources}). "
+            "Either pass a single int (same for all) or one int per source."
+        )
+    return counts
+
+
+def load_samples(data_sources: Sequence[str], split: str, samples_per_source: str, seed: int) -> List[Dict]:
+    per_source_counts = parse_per_source_counts(samples_per_source, data_sources)
     samples = []
-    for offset, data_source in enumerate(data_sources):
+    for offset, (data_source, count) in enumerate(zip(data_sources, per_source_counts)):
         dataset = load_dataset("RUC-NLPIR/FlashRAG_datasets", data_source)
         resolved_split = resolve_split(dataset, split)
         split_dataset = dataset[resolved_split].shuffle(seed=seed + offset)
-        limit = min(samples_per_source, len(split_dataset))
+        limit = min(count, len(split_dataset))
         for idx in range(limit):
             example = split_dataset[idx]
             question = normalize_question(example["question"])
@@ -343,7 +364,9 @@ async def main_async(args):
         "model": args.model,
         "tokenizer": tokenizer_name,
         "data_sources": data_sources,
-        "samples_requested_per_source": args.samples_per_source,
+        "samples_requested_per_source": dict(
+            zip(data_sources, parse_per_source_counts(args.samples_per_source, data_sources))
+        ),
         "processed": stats["processed"],
         "quality_pass": stats["quality_pass"],
         "answer_correct": stats["answer_correct"],

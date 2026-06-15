@@ -42,6 +42,25 @@ class LLMGenerationManager:
             max_start_length=config.max_start_length
         ))
 
+    def _print_validation_step(self, step: int, responses: List[str], observations: List[str]) -> None:
+        if not self.is_validation or not responses:
+            return
+
+        response = responses[0].strip()
+        observation = observations[0].strip()
+        print(f"\n[validation trajectory] turn={step + 1}")
+        print(f"assistant: {response}")
+        if observation:
+            print(f"tool: {observation[:2000]}")
+
+    def _print_validation_trajectory(self, response_ids: torch.Tensor) -> None:
+        if not self.is_validation or response_ids.shape[0] == 0:
+            return
+
+        trajectory = self.tokenizer.decode(response_ids[0], skip_special_tokens=True)
+        print("\n[validation trajectory] complete sample")
+        print(trajectory)
+
     def _batch_tokenize(self, responses: List[str]) -> torch.Tensor:
         """Tokenize a batch of responses."""
         return self.tokenizer(
@@ -253,6 +272,7 @@ class LLMGenerationManager:
             next_obs, dones, valid_action, is_search = self.execute_predictions(
                 responses_str, self.tokenizer.pad_token, active_mask
             )
+            self._print_validation_step(step, responses_str, next_obs)
             
             curr_active_mask = torch.tensor([not done for done in dones], dtype=torch.bool)
             active_mask = active_mask * curr_active_mask
@@ -316,7 +336,9 @@ class LLMGenerationManager:
         
         print("ACTIVE_TRAJ_NUM:", active_num_list)
         
-        return self._compose_final_output(original_left_side, original_right_side, meta_info)
+        final_output = self._compose_final_output(original_left_side, original_right_side, meta_info)
+        self._print_validation_trajectory(final_output.batch['responses'])
+        return final_output
 
     def _compose_final_output(self, left_side: Dict,
                             right_side: Dict,
@@ -455,7 +477,9 @@ If I want to give the final answer, I should put the answer between <answer> and
             "return_scores": True
         }
         
-        return requests.post(self.config.search_url, json=payload).json()
+        response = requests.post(self.config.search_url, json=payload)
+        response.raise_for_status()
+        return response.json()
 
     def _passages2string(self, retrieval_result):
         format_reference = ''
