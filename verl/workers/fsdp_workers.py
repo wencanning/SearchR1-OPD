@@ -495,8 +495,11 @@ class ActorRolloutRefWorker(Worker):
         data.meta_info['use_dynamic_bsz'] = self.config.ref.log_prob_use_dynamic_bsz
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data)
-            output = self.ref_policy.compute_log_prob(data=data)
-            output = DataProto.from_dict(tensors={'ref_log_prob': output})
+            ref_log_prob, ref_entropy = self.ref_policy.compute_log_prob(data=data, return_entropy=True)
+            output = DataProto.from_dict(tensors={
+                'ref_log_prob': ref_log_prob,
+                'ref_entropy': ref_entropy,
+            })
             output = self.ulysses_sharding_manager.postprocess_data(output)
 
         output = output.to('cpu')

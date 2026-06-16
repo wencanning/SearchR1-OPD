@@ -42,6 +42,11 @@ algorithm:
     grpo_reward_coef: 1.0
 
 actor_rollout_ref:
+  actor:
+    clip_ratio: 0.2
+    clip_ratio_low: 0.2
+    clip_ratio_high: 0.28
+    clip_ratio_c: 3.0
   ref:
     model_path: /path/to/teacher
 ```
@@ -56,6 +61,20 @@ than one rollout per prompt, such as `actor_rollout_ref.rollout.n_agent=8`.
 The Search-R1 rule-based final-answer reward is normalized within each prompt
 group and added to the OPD advantage. Observation tokens are excluded from
 both advantage components and all related metrics.
+
+The actor uses asymmetric dual-clip PPO, matching the SOD training setup.
+`clip_ratio_low` and `clip_ratio_high` control the standard PPO ratio bounds.
+For negative advantages, `clip_ratio_c` caps the loss contribution from an
+abnormally large policy ratio. Monitor `actor/pg_clipfrac_lower` to see how
+often this additional bound is active.
+
+`opd/divergence` follows the SOD-style distribution-shift metric: the mean
+absolute student-teacher log-probability gap on trainable tokens.
+`opd/reverse_kl_k1` separately reports the signed sampled reverse-KL estimate.
+
+Monitor `opd/teacher_entropy` alongside `opd/student_entropy` to compare the
+teacher and student categorical entropy on the sampled trajectories. Both
+metrics use the trainable-token mask when state masking is enabled.
 
 Start from `train_opd.sh` and set `STUDENT_MODEL`, `TEACHER_MODEL`, and
 `DATA_DIR` for the local environment.

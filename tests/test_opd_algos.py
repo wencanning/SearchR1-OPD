@@ -4,8 +4,8 @@ import numpy as np
 import torch
 
 from verl import DataProto
-from verl.trainer.ppo.core_algos import compute_opd_advantage
-from verl.trainer.ppo.ray_trainer import compute_advantage, compute_data_metrics
+from verl.trainer.ppo.core_algos import compute_opd_advantage, compute_policy_loss
+from verl.trainer.ppo.ray_trainer import compute_advantage, compute_data_metrics, compute_opd_logprob_metrics
 
 
 class TestOPDAdvantage(unittest.TestCase):
@@ -87,6 +87,17 @@ class TestOPDAdvantage(unittest.TestCase):
         self.assertEqual(metrics['critic/advantages/mean'], 1.5)
         self.assertEqual(metrics['critic/advantages/min'], 1.0)
 
+    def test_opd_divergence_matches_sod_absolute_logprob_gap(self):
+        old_log_probs = torch.tensor([[-2.0, -20.0, -3.0]])
+        ref_log_prob = torch.tensor([[-1.0, 20.0, -1.0]])
+        loss_mask = torch.tensor([[1, 0, 1]], dtype=torch.long)
+
+        metrics = compute_opd_logprob_metrics(old_log_probs, ref_log_prob, loss_mask)
+
+        self.assertEqual(metrics['opd/divergence'], 1.5)
+        self.assertEqual(metrics['opd/reverse_kl_k1'], -1.5)
+        self.assertEqual(metrics['opd/teacher_advantage'], 1.5)
+
     def test_opd_can_add_grpo_outcome_advantage(self):
         batch = DataProto.from_dict(
             tensors={
@@ -112,8 +123,67 @@ class TestOPDAdvantage(unittest.TestCase):
         torch.testing.assert_close(output.batch['opd_advantages'], torch.zeros(2, 3))
         torch.testing.assert_close(output.batch['advantages'], output.batch['grpo_advantages'])
         self.assertTrue(torch.all(output.batch['advantages'][:, 1] == 0))
+
         self.assertGreater(output.batch['advantages'][0, 0].item(), 0)
         self.assertLess(output.batch['advantages'][1, 0].item(), 0)
+
+
+class TestDualClipPPO(unittest.TestCase):
+    def test_dual_clip_caps_large_negative_advantage_loss(self):
+        old_log_prob = torch.zeros(1, 1)
+        log_prob = torch.log(torch.tensor([[5.0]]))
+        advantages = torch.tensor([[-1.0]])
+        mask = torch.ones(1, 1)
+
+        pg_loss, _, _, pg_clipfrac_lower = compute_policy_loss(
+            old_log_prob,
+            log_prob,
+            advantages,
+            mask,
+            cliprange=0.2,
+            clip_ratio_c=3.0,
+        )
+
+        torch.testing.assert_close(pg_loss, torch.tensor(3.0))
+        torch.testing.assert_close(pg_clipfrac_lower, torch.tensor(1.0))
+
+    def test_positive_advantage_uses_asymmetric_upper_clip(self):
+        old_log_prob = torch.zeros(1, 1)
+        log_prob = torch.log(torch.tensor([[5.0]]))
+        advantages = torch.tensor([[1.0]])
+        mask = torch.ones(1, 1)
+
+        pg_loss, _, _, pg_clipfrac_lower = compute_policy_loss(
+            old_log_prob,
+            log_prob,
+            advantages,
+            mask,
+            cliprange=0.2,
+            cliprange_low=0.2,
+            cliprange_high=0.28,
+            clip_ratio_c=3.0,
+        )
+
+        torch.testing.assert_close(pg_loss, torch.tensor(-1.28))
+        torch.testing.assert_close(pg_clipfrac_lower, torch.tensor(0.0))
+
+    def test_policy_loss_excludes_observation_tokens(self):
+        old_log_prob = torch.zeros(1, 2)
+        log_prob = torch.log(torch.tensor([[5.0, 100.0]]))
+        advantages = torch.tensor([[-1.0, -100.0]])
+        loss_mask = torch.tensor([[1.0, 0.0]])
+
+        pg_loss, _, _, pg_clipfrac_lower = compute_policy_loss(
+            old_log_prob,
+            log_prob,
+            advantages,
+            loss_mask,
+            cliprange=0.2,
+            clip_ratio_c=3.0,
+        )
+
+        torch.testing.assert_close(pg_loss, torch.tensor(3.0))
+        torch.testing.assert_close(pg_clipfrac_lower, torch.tensor(1.0))
 
 
 if __name__ == '__main__':

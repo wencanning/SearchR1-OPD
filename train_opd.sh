@@ -3,10 +3,10 @@ set -euo pipefail
 
 export NO_PROXY="${NO_PROXY:+${NO_PROXY},}127.0.0.1,localhost"
 export no_proxy="${no_proxy:+${no_proxy},}127.0.0.1,localhost"
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1,2}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4,5}"
 export VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-XFORMERS}"
 
-DATA_DIR="${DATA_DIR:-data/nq_hotpotqa_train}"
+DATA_DIR="${DATA_DIR:-data/nq_hotpotqa_train_30k_no_cold_start}"
 STUDENT_MODEL="${STUDENT_MODEL:-data/student}"
 TEACHER_MODEL="${TEACHER_MODEL:-/data/home/wencanning/models/SearchR1-nq_hotpotqa_train-qwen2.5-3b-it-em-grpo-v0.3}"
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-nq-search-r1-opd}"
@@ -15,7 +15,7 @@ N_GPUS="${N_GPUS:-$(awk -F, '{print NF}' <<< "$CUDA_VISIBLE_DEVICES")}"
 TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-200}"
 
 PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
-    data.train_files="$DATA_DIR/train_without_cold_start.parquet" \
+    data.train_files="$DATA_DIR/train.parquet" \
     data.val_files="$DATA_DIR/validation_diagnostic_512.parquet" \
     data.train_batch_size=128 \
     data.val_batch_size=256 \
@@ -37,6 +37,9 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.ppo_mini_batch_size=64 \
     actor_rollout_ref.actor.ppo_micro_batch_size=8 \
+    actor_rollout_ref.actor.clip_ratio_low=0.2 \
+    actor_rollout_ref.actor.clip_ratio_high=0.28 \
+    actor_rollout_ref.actor.clip_ratio_c=3.0 \
     actor_rollout_ref.actor.use_kl_loss=false \
     actor_rollout_ref.actor.entropy_coeff=0.0 \
     actor_rollout_ref.actor.state_masking=true \

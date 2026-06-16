@@ -88,6 +88,20 @@ import torch
 from verl.utils.torch_functional import masked_mean
 
 
+def compute_opd_logprob_metrics(old_log_probs: torch.Tensor,
+                                ref_log_prob: torch.Tensor,
+                                mask: torch.Tensor) -> dict:
+    logprob_gap = old_log_probs - ref_log_prob
+    divergence = masked_mean(logprob_gap.abs(), mask).item()
+    reverse_kl_k1 = masked_mean(logprob_gap, mask).item()
+    teacher_advantage = masked_mean(-logprob_gap * mask, mask).item()
+    return {
+        'opd/divergence': divergence,
+        'opd/reverse_kl_k1': reverse_kl_k1,
+        'opd/teacher_advantage': teacher_advantage,
+    }
+
+
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty='kl'):
     responses = data.batch['responses']
     response_length = responses.size(1)
@@ -846,11 +860,16 @@ class RayPPOTrainer(object):
                                 'distillation_coef': self.config.algorithm.opd.distillation_coef,
                                 'grpo_reward_coef': self.config.algorithm.opd.grpo_reward_coef,
                             }
-                            metrics['opd/reverse_kl_k1'] = masked_mean(
-                                batch.batch['old_log_probs'] - batch.batch['ref_log_prob'],
+                            metrics.update(
+                                compute_opd_logprob_metrics(
+                                    old_log_probs=batch.batch['old_log_probs'],
+                                    ref_log_prob=batch.batch['ref_log_prob'],
+                                    mask=opd_mask,
+                                ))
+                            metrics['opd/teacher_entropy'] = masked_mean(
+                                batch.batch['ref_entropy'],
                                 opd_mask,
                             ).item()
-                            metrics['opd/teacher_advantage'] = masked_mean(opd_scores, opd_mask).item()
                         else:
                             # compute scores. Support both model and function-based.
                             if self.use_rm:
@@ -901,6 +920,9 @@ class RayPPOTrainer(object):
                                 batch, metrics = self._create_loss_mask(batch, metrics)
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
+                        if self.use_opd and 'actor/entropy_loss' in actor_output_metrics:
+                            actor_output_metrics['opd/student_entropy'] = actor_output_metrics.pop(
+                                'actor/entropy_loss')
                         metrics.update(actor_output_metrics)
 
                     # validate

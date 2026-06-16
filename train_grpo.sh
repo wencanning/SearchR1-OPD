@@ -1,4 +1,4 @@
-export CUDA_VISIBLE_DEVICES=3,4
+export CUDA_VISIBLE_DEVICES=1,2
 export NO_PROXY="${NO_PROXY:+${NO_PROXY},}127.0.0.1,localhost"
 export no_proxy="${no_proxy:+${no_proxy},}127.0.0.1,localhost"
 export DATA_DIR='data/nq_hotpotqa_train'
@@ -17,8 +17,8 @@ WAND_PROJECT='Search-R1-Eval-Teacher'
 # export BASE_MODEL='meta-llama/Llama-3.1-8B-Instruct'
 # export EXPERIMENT_NAME=nq-search-r1-grpo-llama3.1-8b-it-em
 
-export BASE_MODEL='/data/home/wencanning/models/SearchR1-nq_hotpotqa_train-qwen2.5-3b-it-em-grpo-v0.3'
-export EXPERIMENT_NAME=search-r1-teacher-qwen2.5-3b-grpo-v0.3-eval
+export BASE_MODEL=data/student
+export EXPERIMENT_NAME=search-r1-student-qwen2.5-0.5b-coldstart-eval
 # export BASE_MODEL='Qwen/Qwen2.5-3B-Instruct'
 # export EXPERIMENT_NAME=nq-search-r1-grpo-qwen2.5-3b-it-em
 # export BASE_MODEL='Qwen/Qwen2.5-7B'
@@ -37,7 +37,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     data.train_data_num=null \
     data.val_data_num=null \
     data.train_batch_size=64  \
-    data.val_batch_size=512 \
+    data.val_batch_size=256 \
     data.max_prompt_length=4096 \
     data.max_response_length=512 \
     data.max_start_length=2048 \
