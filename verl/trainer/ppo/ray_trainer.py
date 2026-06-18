@@ -40,6 +40,7 @@ from verl.trainer.ppo import core_algos
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 
 import re
+from search_r1.diagnostics.opd_uncertainty import OPDUncertaintyDumper
 from search_r1.llm_agent.generation import LLMGenerationManager, GenerationConfig
 
 WorkerType = Type[Worker]
@@ -180,6 +181,7 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         grpo_advantages = torch.zeros_like(opd_advantages)
         grpo_reward_coef = opd_config.get('grpo_reward_coef', 0.0)
         distillation_coef = opd_config.get('distillation_coef', 1.0)
+        use_gated_distillation = opd_config.get('use_gated_distillation', False) and grpo_reward_coef != 0
         if grpo_reward_coef != 0:
             grpo_advantages, _ = core_algos.compute_grpo_outcome_advantage(
                 token_level_rewards=data.batch['token_level_rewards'],
@@ -187,12 +189,28 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
                 index=data.non_tensor_batch['uid'],
             )
 
-        advantages = (
-            distillation_coef * opd_advantages
-            + grpo_reward_coef * grpo_advantages
-        )
+        if use_gated_distillation:
+            gamma = opd_config.get('gamma', 1.0)
+            beta_min = opd_config.get('beta_min', 0.0)
+            beta_max = opd_config.get('beta_max', 0.05)
+            task_advantages = masked_mean(grpo_advantages, response_mask, axis=1)
+            gate = torch.sigmoid(-gamma * task_advantages)
+            beta = beta_min + (beta_max - beta_min) * gate
+            weighted_opd_advantages = distillation_coef * beta.unsqueeze(-1) * opd_advantages
+        else:
+            beta = torch.full(
+                (opd_advantages.shape[0],),
+                distillation_coef,
+                dtype=opd_advantages.dtype,
+                device=opd_advantages.device,
+            )
+            weighted_opd_advantages = distillation_coef * opd_advantages
+
+        advantages = weighted_opd_advantages + grpo_reward_coef * grpo_advantages
         returns = advantages
         data.batch['opd_advantages'] = opd_advantages
+        data.batch['opd_beta'] = beta.unsqueeze(-1) * response_mask
+        data.batch['weighted_opd_advantages'] = weighted_opd_advantages
         data.batch['grpo_advantages'] = grpo_advantages
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
@@ -393,6 +411,7 @@ class RayPPOTrainer(object):
         self.use_opd = config.algorithm.adv_estimator == 'opd'
         self.use_rm = Role.RewardModel in role_worker_mapping and not self.use_opd
         self.ray_worker_group_cls = ray_worker_group_cls
+        self.opd_diagnostics = None
 
         if self.use_opd:
             assert self.use_reference_policy, 'OPD requires a teacher/reference policy'
@@ -403,6 +422,12 @@ class RayPPOTrainer(object):
             if config.algorithm.opd.grpo_reward_coef != 0:
                 group_size = config.actor_rollout_ref.rollout.n_agent * config.actor_rollout_ref.rollout.n
                 assert group_size > 1, 'OPD + GRPO reward requires more than one rollout per prompt'
+            if config.algorithm.opd.get('diagnostics', {}).get('enable', False):
+                self.opd_diagnostics = OPDUncertaintyDumper(
+                    tokenizer=self.tokenizer,
+                    trainer_config=config.trainer,
+                    opd_config=config.algorithm.opd,
+                )
 
         # define KL control
         if self.use_reference_policy:
@@ -802,6 +827,8 @@ class RayPPOTrainer(object):
                             final_gen_batch_output.batch[key] = final_gen_batch_output.batch[key].long()
 
                         with torch.no_grad():
+                            if self.opd_diagnostics is not None and self.opd_diagnostics.should_dump(self.global_steps):
+                                final_gen_batch_output.meta_info['return_entropy'] = True
                             output = self.actor_rollout_wg.compute_log_prob(final_gen_batch_output)
                             final_gen_batch_output = final_gen_batch_output.union(output)
 
@@ -859,6 +886,10 @@ class RayPPOTrainer(object):
                                 'clip_value': self.config.algorithm.opd.clip_value,
                                 'distillation_coef': self.config.algorithm.opd.distillation_coef,
                                 'grpo_reward_coef': self.config.algorithm.opd.grpo_reward_coef,
+                                'use_gated_distillation': self.config.algorithm.opd.get('use_gated_distillation', True),
+                                'gamma': self.config.algorithm.opd.get('gamma', 1.0),
+                                'beta_min': self.config.algorithm.opd.get('beta_min', 0.0),
+                                'beta_max': self.config.algorithm.opd.get('beta_max', 0.05),
                             }
                             metrics.update(
                                 compute_opd_logprob_metrics(
@@ -897,12 +928,30 @@ class RayPPOTrainer(object):
                             metrics['opd/distillation_advantage'] = masked_mean(
                                 batch.batch['opd_advantages'], opd_mask
                             ).item()
+                            metrics['opd/weighted_distillation_advantage'] = masked_mean(
+                                batch.batch['weighted_opd_advantages'], opd_mask
+                            ).item()
+                            metrics['opd/beta'] = masked_mean(
+                                batch.batch['opd_beta'], opd_mask
+                            ).item()
                             metrics['opd/grpo_advantage'] = masked_mean(
                                 batch.batch['grpo_advantages'], opd_mask
                             ).item()
                             metrics['opd/combined_advantage'] = masked_mean(
                                 batch.batch['advantages'], opd_mask
                             ).item()
+                            if self.opd_diagnostics is not None and self.opd_diagnostics.should_dump(self.global_steps):
+                                with _timer('opd_diagnostics', timing_raw):
+                                    diagnostics_path = self.opd_diagnostics.dump(
+                                        batch=batch,
+                                        opd_mask=opd_mask,
+                                        global_step=self.global_steps,
+                                        epoch=epoch,
+                                        metrics=metrics,
+                                    )
+                                metrics['opd_diagnostics/trajectories'] = float(
+                                    min(self.opd_diagnostics.max_sequences_per_step, len(batch)))
+                                print(f'OPD diagnostics saved: {diagnostics_path}')
 
                     # update critic
                     if self.use_critic:

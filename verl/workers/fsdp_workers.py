@@ -402,6 +402,7 @@ class ActorRolloutRefWorker(Worker):
     def compute_log_prob(self, data: DataProto) -> DataProto:
         """mostly copying from generate_sequences"""
         data = data.to('cuda')
+        return_entropy = data.meta_info.get('return_entropy', False)
 
         assert self._is_rollout
         if self._is_offload_param:
@@ -415,8 +416,15 @@ class ActorRolloutRefWorker(Worker):
 
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data)
-            old_log_probs = self.actor.compute_log_prob(data=data)
-            output = DataProto.from_dict(tensors={'old_log_probs': old_log_probs})
+            if return_entropy:
+                old_log_probs, old_entropy = self.actor.compute_log_prob(data=data, return_entropy=True)
+                output = DataProto.from_dict(tensors={
+                    'old_log_probs': old_log_probs,
+                    'old_entropy': old_entropy,
+                })
+            else:
+                old_log_probs = self.actor.compute_log_prob(data=data)
+                output = DataProto.from_dict(tensors={'old_log_probs': old_log_probs})
             output = self.ulysses_sharding_manager.postprocess_data(output)
             
         output = output.to('cpu')

@@ -6,6 +6,7 @@ import torch
 from verl import DataProto
 from verl.trainer.ppo.core_algos import compute_opd_advantage, compute_policy_loss
 from verl.trainer.ppo.ray_trainer import compute_advantage, compute_data_metrics, compute_opd_logprob_metrics
+from verl.utils.torch_functional import masked_mean
 
 
 class TestOPDAdvantage(unittest.TestCase):
@@ -126,6 +127,45 @@ class TestOPDAdvantage(unittest.TestCase):
 
         self.assertGreater(output.batch['advantages'][0, 0].item(), 0)
         self.assertLess(output.batch['advantages'][1, 0].item(), 0)
+
+    def test_opd_rl_uses_sigmoid_beta_gate_for_distillation(self):
+        batch = DataProto.from_dict(
+            tensors={
+                'responses': torch.ones(2, 2, dtype=torch.long),
+                'attention_mask': torch.ones(2, 4, dtype=torch.long),
+                'loss_mask': torch.ones(2, 2, dtype=torch.long),
+                'old_log_probs': torch.zeros(2, 2),
+                'ref_log_prob': torch.ones(2, 2),
+                'token_level_rewards': torch.tensor([[1.0, 0.0], [0.0, 0.0]]),
+            },
+            non_tensors={'uid': np.array(['prompt', 'prompt'], dtype=object)},
+        )
+        batch.meta_info['opd_config'] = {
+            'advantage_mode': 'token',
+            'normalize': False,
+            'clip_value': None,
+            'distillation_coef': 1.0,
+            'grpo_reward_coef': 1.0,
+            'use_gated_distillation': True,
+            'gamma': 1.0,
+            'beta_min': 0.0,
+            'beta_max': 0.05,
+        }
+
+        output = compute_advantage(batch, 'opd')
+
+        mask = torch.ones(2, 2)
+        task_advantages = masked_mean(output.batch['grpo_advantages'], mask, axis=1)
+        expected_beta = 0.05 * torch.sigmoid(-task_advantages)
+        expected_beta = expected_beta.unsqueeze(-1).expand_as(output.batch['opd_beta'])
+
+        torch.testing.assert_close(output.batch['opd_advantages'], torch.ones(2, 2))
+        torch.testing.assert_close(output.batch['opd_beta'], expected_beta)
+        torch.testing.assert_close(output.batch['weighted_opd_advantages'], expected_beta)
+        torch.testing.assert_close(
+            output.batch['advantages'],
+            output.batch['grpo_advantages'] + expected_beta,
+        )
 
 
 class TestDualClipPPO(unittest.TestCase):

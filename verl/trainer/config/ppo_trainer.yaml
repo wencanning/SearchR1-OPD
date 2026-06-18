@@ -168,6 +168,21 @@ algorithm:
     distillation_coef: 1.0
     # Set > 0 to add group-normalized Search-R1 outcome reward to OPD.
     grpo_reward_coef: 0.0
+    # Gate token-level distillation by task advantage for OPD+RL.
+    use_gated_distillation: true
+    gamma: 1.0
+    beta_min: 0.0
+    beta_max: 0.05
+    diagnostics:
+      enable: false
+      output_dir: null
+      every_n_steps: 1
+      max_sequences_per_step: 64
+      sample_strategy: random  # random, head, entropy_top
+      float_precision: 4
+      include_token_text: true
+      include_decoded_response: true
+      top_entropy_tokens: 32
   no_think_rl: False
   kl_penalty: kl  # how to estimate kl divergence
   kl_ctrl:

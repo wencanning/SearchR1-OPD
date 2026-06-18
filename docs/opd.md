@@ -15,8 +15,10 @@ with the group-normalized Search-R1 outcome reward:
 
 ```text
 combined_advantage =
-    distillation_coef * opd_advantage
+    distillation_coef * beta * opd_advantage
     + grpo_reward_coef * grpo_outcome_advantage
+
+beta = beta_min + (beta_max - beta_min) * sigmoid(-gamma * task_advantage)
 ```
 
 ## Requirements
@@ -40,6 +42,10 @@ algorithm:
     clip_value: null
     distillation_coef: 1.0
     grpo_reward_coef: 1.0
+    use_gated_distillation: true
+    gamma: 1.0
+    beta_min: 0.0
+    beta_max: 0.05
 
 actor_rollout_ref:
   actor:
@@ -59,8 +65,34 @@ Use `clip_value` to limit high-variance teacher/student log-probability gaps.
 Set `grpo_reward_coef=0.0` for pure OPD. When it is nonzero, configure more
 than one rollout per prompt, such as `actor_rollout_ref.rollout.n_agent=8`.
 The Search-R1 rule-based final-answer reward is normalized within each prompt
-group and added to the OPD advantage. Observation tokens are excluded from
-both advantage components and all related metrics.
+group and added to the OPD advantage. With `use_gated_distillation=true`, the
+OPD component is scaled by a per-sequence sigmoid beta gate from the normalized
+task advantage, matching the SOD repo baseline OPD setup. Observation tokens
+are excluded from both advantage components and all related metrics.
+
+`use_gated_distillation` is only active when `grpo_reward_coef != 0`. If
+`grpo_reward_coef=0.0`, OPD is plain reverse-KL distillation regardless of the
+gate setting:
+
+```text
+combined_advantage = distillation_coef * opd_advantage
+```
+
+Common modes:
+
+```bash
+# Plain OPD, no GRPO reward and no sigmoid gate.
+./train_plain_opd.sh
+
+# Equivalent explicit invocation.
+OPD_GRPO_REWARD_COEF=0.0 OPD_USE_GATED_DISTILLATION=false OPD_N_AGENT=1 ./train_opd.sh
+
+# OPD + GRPO reward, but no sigmoid gate.
+OPD_GRPO_REWARD_COEF=1.0 OPD_USE_GATED_DISTILLATION=false OPD_N_AGENT=8 ./train_opd.sh
+
+# Sigmoid-gated OPD + GRPO reward.
+OPD_GRPO_REWARD_COEF=1.0 OPD_USE_GATED_DISTILLATION=true OPD_N_AGENT=8 ./train_opd.sh
+```
 
 The actor uses asymmetric dual-clip PPO, matching the SOD training setup.
 `clip_ratio_low` and `clip_ratio_high` control the standard PPO ratio bounds.
