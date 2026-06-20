@@ -166,6 +166,42 @@ def infer_token_segments(token_texts: List[str]) -> tuple[List[str], List[int]]:
     return segments, turn_ids
 
 
+def infer_evidence_step_ids(token_texts: List[str]) -> List[int]:
+    """Infer step ids by counting completed information blocks before each token."""
+    text = "".join(token_texts)
+    spans = []
+    cursor = 0
+    for token_text in token_texts:
+        start = cursor
+        cursor += len(token_text)
+        spans.append((start, cursor))
+
+    tags = list(TAG_PATTERN.finditer(text))
+    step_ids = []
+    tag_idx = 0
+    step_id = 0
+    for start, end in spans:
+        midpoint = (start + end) / 2
+        while tag_idx < len(tags) and tags[tag_idx].end() <= midpoint:
+            if tags[tag_idx].group(0) == "</information>":
+                step_id += 1
+            tag_idx += 1
+        step_ids.append(step_id)
+    return step_ids
+
+
+def retrieval_hits_by_information_block(text: str, targets: List[str]) -> Optional[List[bool]]:
+    if not targets:
+        return None
+    blocks = INFO_PATTERN.findall(text)
+    normalized_targets = [_normalize_answer(target) for target in targets]
+    hits = []
+    for block in blocks:
+        normalized_block = _normalize_answer(block)
+        hits.append(any(target in normalized_block for target in normalized_targets))
+    return hits
+
+
 class OPDUncertaintyDumper:
     """Persist compressed OPD uncertainty traces for offline analysis."""
 
@@ -194,6 +230,7 @@ class OPDUncertaintyDumper:
         self.include_token_text = bool(_cfg_get(diagnostics_config, "include_token_text", True))
         self.include_decoded_response = bool(_cfg_get(diagnostics_config, "include_decoded_response", True))
         self.top_entropy_tokens = int(_cfg_get(diagnostics_config, "top_entropy_tokens", 32))
+        self.compress = bool(_cfg_get(diagnostics_config, "compress", False))
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
     def should_dump(self, global_step: int) -> bool:
@@ -219,12 +256,14 @@ class OPDUncertaintyDumper:
         return sorted(rng.sample(indices, limit))
 
     def dump(self, batch: Any, opd_mask: torch.Tensor, global_step: int, epoch: int, metrics: Dict[str, float]) -> Path:
-        path = self.output_dir / f"step_{global_step:06d}.jsonl.gz"
+        suffix = "jsonl.gz" if self.compress else "jsonl"
+        path = self.output_dir / f"step_{global_step:06d}.{suffix}"
         selected_indices = self._select_indices(batch, opd_mask, global_step)
         response_length = batch.batch["responses"].shape[-1]
         response_mask = batch.batch["attention_mask"][:, -response_length:]
 
-        with gzip.open(path, "wt", encoding="utf-8") as f:
+        opener = gzip.open if self.compress else open
+        with opener(path, "wt", encoding="utf-8") as f:
             header = {
                 "record_type": "metadata",
                 "global_step": global_step,
@@ -301,6 +340,11 @@ class OPDUncertaintyDumper:
             ),
             "opd_advantage": _float_list(tensors["opd_advantages"][seq_idx], valid_len, self.float_precision)
             if "opd_advantages" in tensors else None,
+            "opd_rce_weight": _float_list(tensors["opd_rce_weights"][seq_idx], valid_len, self.float_precision)
+            if "opd_rce_weights" in tensors else None,
+            "opd_effective_distillation_coef": _float_list(
+                tensors["opd_effective_distillation_coef"][seq_idx], valid_len, self.float_precision
+            ) if "opd_effective_distillation_coef" in tensors else None,
             "weighted_opd_advantage": _float_list(
                 tensors["weighted_opd_advantages"][seq_idx], valid_len, self.float_precision
             ) if "weighted_opd_advantages" in tensors else None,

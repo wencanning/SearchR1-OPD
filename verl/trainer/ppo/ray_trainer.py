@@ -87,6 +87,13 @@ class ResourcePoolManager:
 
 import torch
 from verl.utils.torch_functional import masked_mean
+from search_r1.diagnostics.opd_uncertainty import (
+    _decode_token,
+    _ground_truth_targets,
+    _retrieval_hit,
+    infer_evidence_step_ids,
+    retrieval_hits_by_information_block,
+)
 
 
 def compute_opd_logprob_metrics(old_log_probs: torch.Tensor,
@@ -170,14 +177,42 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         response_mask = data.batch['loss_mask'] if 'loss_mask' in data.batch else \
             data.batch['attention_mask'][:, -response_length:]
         opd_config = data.meta_info['opd_config']
-        opd_advantages, _ = core_algos.compute_opd_advantage(
-            old_log_prob=data.batch['old_log_probs'],
-            teacher_log_prob=data.batch['ref_log_prob'],
-            eos_mask=response_mask,
-            advantage_mode=opd_config['advantage_mode'],
-            normalize=opd_config['normalize'],
-            clip_value=opd_config['clip_value'],
-        )
+        rce_config = opd_config.get('rce', {})
+        use_rce = rce_config.get('enable', False)
+        if use_rce:
+            if 'ref_entropy' not in data.batch:
+                raise ValueError('RCE-OPD requires ref_entropy from the teacher/reference policy')
+            retrieval_hit = data.batch['rce_retrieval_hit'] if 'rce_retrieval_hit' in data.batch else None
+            step_ids = data.batch['rce_step_ids'] if 'rce_step_ids' in data.batch else None
+            opd_advantages, _, rce_weights = core_algos.compute_rce_opd_advantage(
+                old_log_prob=data.batch['old_log_probs'],
+                teacher_log_prob=data.batch['ref_log_prob'],
+                teacher_entropy=data.batch['ref_entropy'],
+                eos_mask=response_mask,
+                retrieval_hit=retrieval_hit,
+                step_ids=step_ids,
+                advantage_mode=opd_config['advantage_mode'],
+                normalize=opd_config['normalize'],
+                clip_value=opd_config['clip_value'],
+                entropy_normalization=rce_config.get('entropy_normalization', 'percentile_rank'),
+                w_min=rce_config.get('w_min', 0.1),
+                w_max=rce_config.get('w_max', 1.0),
+                alpha=rce_config.get('alpha', 4.0),
+                tau=rce_config.get('tau', 0.0),
+                default_retrieval_hit=rce_config.get('default_retrieval_hit', 0.5),
+                eps=rce_config.get('eps', 1e-8),
+                return_weights=True,
+            )
+        else:
+            opd_advantages, _ = core_algos.compute_opd_advantage(
+                old_log_prob=data.batch['old_log_probs'],
+                teacher_log_prob=data.batch['ref_log_prob'],
+                eos_mask=response_mask,
+                advantage_mode=opd_config['advantage_mode'],
+                normalize=opd_config['normalize'],
+                clip_value=opd_config['clip_value'],
+            )
+            rce_weights = torch.zeros_like(opd_advantages)
         grpo_advantages = torch.zeros_like(opd_advantages)
         grpo_reward_coef = opd_config.get('grpo_reward_coef', 0.0)
         distillation_coef = opd_config.get('distillation_coef', 1.0)
@@ -196,20 +231,22 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
             task_advantages = masked_mean(grpo_advantages, response_mask, axis=1)
             gate = torch.sigmoid(-gamma * task_advantages)
             beta = beta_min + (beta_max - beta_min) * gate
-            weighted_opd_advantages = distillation_coef * beta.unsqueeze(-1) * opd_advantages
         else:
             beta = torch.full(
                 (opd_advantages.shape[0],),
-                distillation_coef,
+                1.0,
                 dtype=opd_advantages.dtype,
                 device=opd_advantages.device,
             )
-            weighted_opd_advantages = distillation_coef * opd_advantages
+        effective_distillation_coef = distillation_coef * beta
+        weighted_opd_advantages = effective_distillation_coef.unsqueeze(-1) * opd_advantages
 
         advantages = weighted_opd_advantages + grpo_reward_coef * grpo_advantages
         returns = advantages
         data.batch['opd_advantages'] = opd_advantages
+        data.batch['opd_rce_weights'] = rce_weights
         data.batch['opd_beta'] = beta.unsqueeze(-1) * response_mask
+        data.batch['opd_effective_distillation_coef'] = effective_distillation_coef.unsqueeze(-1) * response_mask
         data.batch['weighted_opd_advantages'] = weighted_opd_advantages
         data.batch['grpo_advantages'] = grpo_advantages
         data.batch['advantages'] = advantages
@@ -735,6 +772,68 @@ class RayPPOTrainer(object):
                                                     prefix=logging_prefix)
         metrics.update(global_balance_stats)
 
+    def _create_rce_metadata(self, batch: DataProto, metrics: dict):
+        """Create token-aligned RCE metadata from decoded Search-R1 trajectories."""
+        response_length = batch.batch['responses'].size(-1)
+        response_mask = batch.batch['attention_mask'][:, -response_length:]
+        rce_config = self.config.algorithm.opd.get('rce', {})
+        default_retrieval_hit = float(rce_config.get('default_retrieval_hit', 0.5))
+
+        step_ids = torch.full_like(batch.batch['responses'], -1, dtype=torch.long)
+        retrieval_hit = torch.full_like(batch.batch['responses'], default_retrieval_hit, dtype=torch.float32)
+        sequence_retrieval_hit = torch.full(
+            (batch.batch['responses'].shape[0],),
+            default_retrieval_hit,
+            dtype=torch.float32,
+        )
+        retrieval_hit_known = torch.zeros_like(sequence_retrieval_hit, dtype=torch.bool)
+        reward_models = batch.non_tensor_batch.get("reward_model", [None] * len(batch))
+
+        for seq_idx in range(len(batch)):
+            valid_len = int(response_mask[seq_idx].sum().item())
+            response_ids = batch.batch["responses"][seq_idx, :valid_len].detach().cpu().tolist()
+            token_texts = [_decode_token(self.tokenizer, int(token_id)) for token_id in response_ids]
+            evidence_step_ids = infer_evidence_step_ids(token_texts)
+            if evidence_step_ids:
+                step_ids[seq_idx, :valid_len] = torch.tensor(
+                    evidence_step_ids,
+                    dtype=torch.long,
+                    device=step_ids.device,
+                )
+
+            targets = _ground_truth_targets(reward_models[seq_idx])
+            decoded_response = "".join(token_texts)
+            sequence_hit = _retrieval_hit(decoded_response, targets)
+            block_hits = retrieval_hits_by_information_block(decoded_response, targets)
+            if sequence_hit is not None:
+                sequence_retrieval_hit[seq_idx] = float(sequence_hit)
+                retrieval_hit_known[seq_idx] = True
+            if block_hits is not None:
+                for token_idx, step_id in enumerate(evidence_step_ids):
+                    if step_id > 0 and step_id - 1 < len(block_hits):
+                        retrieval_hit[seq_idx, token_idx] = float(block_hits[step_id - 1])
+
+        batch.batch['rce_step_ids'] = step_ids
+        batch.batch['rce_retrieval_hit'] = retrieval_hit
+
+        known_count = retrieval_hit_known.sum().item()
+        if known_count > 0:
+            metrics['opd/rce_retrieval_hit_proxy'] = sequence_retrieval_hit[retrieval_hit_known].mean().item()
+            metrics['opd/rce_retrieval_hit_known'] = float(known_count)
+        step_counts = []
+        for seq_idx in range(len(batch)):
+            valid_steps = step_ids[seq_idx][response_mask[seq_idx].bool() & (step_ids[seq_idx] >= 0)]
+            step_counts.append(float(torch.unique(valid_steps).numel()) if valid_steps.numel() > 0 else 0.0)
+        metrics['opd/rce_step_count_mean'] = float(np.mean(step_counts)) if step_counts else 0.0
+
+        return batch, metrics
+
+    @staticmethod
+    def _plain_config(config):
+        if OmegaConf.is_config(config):
+            return OmegaConf.to_container(config, resolve=True)
+        return dict(config) if isinstance(config, dict) else {}
+
     def fit(self):
         """
         The training loop of PPO.
@@ -827,7 +926,10 @@ class RayPPOTrainer(object):
                             final_gen_batch_output.batch[key] = final_gen_batch_output.batch[key].long()
 
                         with torch.no_grad():
-                            if self.opd_diagnostics is not None and self.opd_diagnostics.should_dump(self.global_steps):
+                            if self.use_opd or (
+                                self.opd_diagnostics is not None
+                                and self.opd_diagnostics.should_dump(self.global_steps)
+                            ):
                                 final_gen_batch_output.meta_info['return_entropy'] = True
                             output = self.actor_rollout_wg.compute_log_prob(final_gen_batch_output)
                             final_gen_batch_output = final_gen_batch_output.union(output)
@@ -848,8 +950,9 @@ class RayPPOTrainer(object):
                     batch.meta_info['global_token_num'] = torch.sum(batch.batch['attention_mask'], dim=-1).tolist()
 
                     # batch.batch.apply(lambda x, key: x.long() if key != "old_log_probs" else x, inplace=True, key=True)
+                    float_batch_keys = {'old_log_probs', 'old_entropy'}
                     for key in batch.batch.keys():
-                        if key != 'old_log_probs':
+                        if key not in float_batch_keys:
                             batch.batch[key] = batch.batch[key].long()
 
                     if self.use_reference_policy:
@@ -866,6 +969,8 @@ class RayPPOTrainer(object):
 
                     if self.use_opd and self.config.do_search and self.config.actor_rollout_ref.actor.state_masking:
                         batch, metrics = self._create_loss_mask(batch, metrics)
+                    if self.use_opd and self.config.algorithm.opd.get('rce', {}).get('enable', False):
+                        batch, metrics = self._create_rce_metadata(batch, metrics)
 
                     with _timer('adv', timing_raw):
                         if self.use_opd:
@@ -890,6 +995,7 @@ class RayPPOTrainer(object):
                                 'gamma': self.config.algorithm.opd.get('gamma', 1.0),
                                 'beta_min': self.config.algorithm.opd.get('beta_min', 0.0),
                                 'beta_max': self.config.algorithm.opd.get('beta_max', 0.05),
+                                'rce': self._plain_config(self.config.algorithm.opd.get('rce', {})),
                             }
                             metrics.update(
                                 compute_opd_logprob_metrics(
@@ -901,6 +1007,11 @@ class RayPPOTrainer(object):
                                 batch.batch['ref_entropy'],
                                 opd_mask,
                             ).item()
+                            if 'old_entropy' in batch.batch:
+                                metrics['opd/student_entropy'] = masked_mean(
+                                    batch.batch['old_entropy'],
+                                    opd_mask,
+                                ).item()
                         else:
                             # compute scores. Support both model and function-based.
                             if self.use_rm:
@@ -934,6 +1045,41 @@ class RayPPOTrainer(object):
                             metrics['opd/beta'] = masked_mean(
                                 batch.batch['opd_beta'], opd_mask
                             ).item()
+                            metrics['opd/effective_distillation_coef'] = masked_mean(
+                                batch.batch['opd_effective_distillation_coef'], opd_mask
+                            ).item()
+                            if self.config.algorithm.opd.get('rce', {}).get('enable', False):
+                                metrics['opd/rce_weight'] = masked_mean(
+                                    batch.batch['opd_rce_weights'], opd_mask
+                                ).item()
+                                if 'rce_retrieval_hit' in batch.batch:
+                                    rce_retrieval_hit = batch.batch['rce_retrieval_hit'].float()
+                                    rce_known_mask = (
+                                        ((rce_retrieval_hit == 0.0) | (rce_retrieval_hit == 1.0)).float()
+                                        * opd_mask
+                                    )
+                                    hit_mask = (rce_retrieval_hit > 0.5).float() * rce_known_mask
+                                    miss_mask = (rce_retrieval_hit < 0.5).float() * rce_known_mask
+                                    known_tokens = rce_known_mask.sum()
+                                    if known_tokens.item() > 0:
+                                        metrics['opd/rce_known_token_fraction'] = (
+                                            known_tokens / opd_mask.sum()
+                                        ).item()
+                                        metrics['opd/rce_token_hit_rate'] = (
+                                            hit_mask.sum() / known_tokens
+                                        ).item()
+                                    if hit_mask.sum().item() > 0:
+                                        metrics['opd/rce_weight_hit'] = masked_mean(
+                                            batch.batch['opd_rce_weights'], hit_mask
+                                        ).item()
+                                    if miss_mask.sum().item() > 0:
+                                        metrics['opd/rce_weight_miss'] = masked_mean(
+                                            batch.batch['opd_rce_weights'], miss_mask
+                                        ).item()
+                                    if 'opd/rce_weight_hit' in metrics and 'opd/rce_weight_miss' in metrics:
+                                        metrics['opd/rce_weight_delta_hit_minus_miss'] = (
+                                            metrics['opd/rce_weight_hit'] - metrics['opd/rce_weight_miss']
+                                        )
                             metrics['opd/grpo_advantage'] = masked_mean(
                                 batch.batch['grpo_advantages'], opd_mask
                             ).item()
@@ -970,8 +1116,12 @@ class RayPPOTrainer(object):
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
                         if self.use_opd and 'actor/entropy_loss' in actor_output_metrics:
-                            actor_output_metrics['opd/student_entropy'] = actor_output_metrics.pop(
-                                'actor/entropy_loss')
+                            entropy_key = (
+                                'opd/update_student_entropy'
+                                if 'opd/student_entropy' in metrics
+                                else 'opd/student_entropy'
+                            )
+                            actor_output_metrics[entropy_key] = actor_output_metrics.pop('actor/entropy_loss')
                         metrics.update(actor_output_metrics)
 
                     # validate

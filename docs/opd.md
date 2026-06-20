@@ -46,6 +46,14 @@ algorithm:
     gamma: 1.0
     beta_min: 0.0
     beta_max: 0.05
+    rce:
+      enable: false
+      entropy_normalization: percentile_rank
+      w_min: 0.1
+      w_max: 1.0
+      alpha: 4.0
+      tau: 0.0
+      default_retrieval_hit: 0.5
 
 actor_rollout_ref:
   actor:
@@ -67,8 +75,9 @@ than one rollout per prompt, such as `actor_rollout_ref.rollout.n_agent=8`.
 The Search-R1 rule-based final-answer reward is normalized within each prompt
 group and added to the OPD advantage. With `use_gated_distillation=true`, the
 OPD component is scaled by a per-sequence sigmoid beta gate from the normalized
-task advantage, matching the SOD repo baseline OPD setup. Observation tokens
-are excluded from both advantage components and all related metrics.
+task advantage. This mirrors the legacy gated OPD branch in the SOD code, but
+the SOD `run_sod.sh` main path enables step-wise weighting instead. Observation
+tokens are excluded from both advantage components and all related metrics.
 
 `use_gated_distillation` is only active when `grpo_reward_coef != 0`. If
 `grpo_reward_coef=0.0`, OPD is plain reverse-KL distillation regardless of the
@@ -76,6 +85,64 @@ gate setting:
 
 ```text
 combined_advantage = distillation_coef * opd_advantage
+```
+
+## Retrieval-Conditioned Entropy Gate
+
+RCE-OPD adds a separate tensor-level interface,
+`compute_rce_opd_advantage(...)`, for retrieval-conditioned entropy-gated OPD:
+
+```text
+rce_weight =
+    w_min + (w_max - w_min)
+    * sigmoid(alpha * (retrieval_hit - normalized_teacher_entropy - tau))
+
+rce_opd_advantage =
+    rce_weight * (log p_teacher(token | context) - log p_student(token | context))
+```
+
+If `step_ids` are provided, teacher entropy is averaged per step before
+normalization and the same step weight is applied to all trainable tokens in
+that step. Retrieved `<information>...</information>` tokens remain excluded by
+`loss_mask`.
+
+The current trainer path creates `rce_step_ids` by decoding Search-R1 tags.
+Step 0 covers tokens before any completed `<information>` block; step 1 covers
+tokens after the first completed information block; and so on. For each
+information block, the trainer checks whether it contains a gold target string
+and uses that block-level hit as `r_{k-1}` for the following step. This makes the
+experiment runnable with the existing rollout data while preserving the
+"previous retrieved evidence" semantics. A future rollout-side per-search hit
+tensor can be passed to the same interface as `rce_retrieval_hit` without
+changing the loss implementation.
+
+The plain OPD diagnostics support this direction:
+
+- 25,088 retained trajectories had retrieval hit rate 0.620, so hit/miss states
+  are both common enough for a gate to matter.
+- Retrieval-miss trajectories had consistently higher teacher entropy than hit
+  trajectories after search, e.g. turn 1: 0.899 vs 0.728, turn 2: 1.167 vs
+  0.980, turn 4: 1.437 vs 1.336.
+- Wrong trajectories also had higher teacher entropy after search, suggesting
+  teacher uncertainty is tied to poor evidence states rather than only format
+  noise.
+
+Enable it with:
+
+```bash
+OPD_RCE_ENABLE=true ./train_opd.sh
+```
+
+Useful overrides:
+
+```bash
+OPD_RCE_ENABLE=true \
+OPD_RCE_ENTROPY_NORMALIZATION=robust_minmax \
+OPD_RCE_W_MIN=0.1 \
+OPD_RCE_W_MAX=1.0 \
+OPD_RCE_ALPHA=4.0 \
+OPD_RCE_TAU=0.0 \
+./train_opd.sh
 ```
 
 Common modes:
@@ -107,6 +174,9 @@ absolute student-teacher log-probability gap on trainable tokens.
 Monitor `opd/teacher_entropy` alongside `opd/student_entropy` to compare the
 teacher and student categorical entropy on the sampled trajectories. Both
 metrics use the trainable-token mask when state masking is enabled.
+`opd/beta` is the dynamic gate factor (`1.0` when gated distillation is off);
+`opd/effective_distillation_coef` is the actual coefficient multiplying the OPD
+advantage.
 
 Start from `train_opd.sh` and set `STUDENT_MODEL`, `TEACHER_MODEL`, and
 `DATA_DIR` for the local environment.

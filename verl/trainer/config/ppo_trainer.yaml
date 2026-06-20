@@ -173,6 +173,16 @@ algorithm:
     gamma: 1.0
     beta_min: 0.0
     beta_max: 0.05
+    # Retrieval-Conditioned Entropy-gated OPD. Disabled by default.
+    rce:
+      enable: false
+      entropy_normalization: percentile_rank  # percentile_rank, robust_minmax, none
+      w_min: 0.1
+      w_max: 1.0
+      alpha: 4.0
+      tau: 0.0
+      default_retrieval_hit: 0.5
+      eps: 1.0e-8
     diagnostics:
       enable: false
       output_dir: null
@@ -183,6 +193,7 @@ algorithm:
       include_token_text: true
       include_decoded_response: true
       top_entropy_tokens: 32
+      compress: false
   no_think_rl: False
   kl_penalty: kl  # how to estimate kl divergence
   kl_ctrl:

@@ -190,6 +190,222 @@ def compute_opd_advantage(old_log_prob: torch.Tensor,
     return advantages, advantages
 
 
+def _normalize_vector(values: torch.Tensor,
+                      method: str = 'percentile_rank',
+                      eps: float = 1e-8):
+    normalized = torch.full_like(values, 0.5, dtype=torch.float32)
+    if values.numel() == 0:
+        return normalized
+    values = values.float()
+    if values.numel() == 1:
+        return normalized
+    if method == 'percentile_rank':
+        sorted_values, sorted_indices = torch.sort(values)
+        unique_values = torch.unique(sorted_values, sorted=True)
+        if unique_values.numel() == 1:
+            return normalized
+        for unique_value in unique_values:
+            tie_mask = sorted_values == unique_value
+            tie_positions = torch.nonzero(tie_mask, as_tuple=False).squeeze(-1).float()
+            normalized[sorted_indices[tie_mask]] = tie_positions.mean() / (values.numel() - 1)
+    elif method == 'robust_minmax':
+        if values.numel() == 1:
+            return normalized
+        q05 = torch.quantile(values, 0.05)
+        q95 = torch.quantile(values, 0.95)
+        normalized = torch.clamp((values - q05) / (q95 - q05 + eps), 0.0, 1.0)
+    elif method == 'none':
+        normalized = torch.clamp(values, 0.0, 1.0)
+    else:
+        raise ValueError(f"Unsupported entropy normalization method: {method}")
+    return normalized
+
+
+def _compute_sequence_values(values: torch.Tensor,
+                             mask: torch.Tensor,
+                             default_value: float):
+    sequence_values = torch.full_like(values, default_value, dtype=torch.float32)
+    valid_sequence_values = []
+    valid_sequence_indices = []
+    for batch_idx in range(values.shape[0]):
+        sequence_mask = mask[batch_idx].bool()
+        if not torch.any(sequence_mask):
+            continue
+        sequence_value = values[batch_idx, sequence_mask].float().mean()
+        sequence_values[batch_idx, sequence_mask] = sequence_value
+        valid_sequence_values.append(sequence_value)
+        valid_sequence_indices.append(batch_idx)
+    return sequence_values, valid_sequence_values, valid_sequence_indices
+
+
+def _normalize_sequence_values(values: torch.Tensor,
+                               valid_values: list,
+                               valid_indices: list,
+                               method: str,
+                               eps: float):
+    normalized = torch.full_like(values, 0.5, dtype=torch.float32)
+    if not valid_values:
+        return normalized
+    normalized_valid = _normalize_vector(torch.stack(valid_values), method=method, eps=eps)
+    for norm_value, batch_idx in zip(normalized_valid, valid_indices):
+        normalized[batch_idx] = norm_value
+    return normalized
+
+
+def _compute_step_values_and_normalized_entropy(values: torch.Tensor,
+                                                retrieval_values: torch.Tensor,
+                                                mask: torch.Tensor,
+                                                step_ids: torch.Tensor,
+                                                entropy_normalization: str,
+                                                default_retrieval_hit: float,
+                                                eps: float):
+    entropy_values = torch.full_like(values, 0.0, dtype=torch.float32)
+    normalized_entropy = torch.full_like(values, 0.5, dtype=torch.float32)
+    step_retrieval_values = torch.full_like(values, default_retrieval_hit, dtype=torch.float32)
+
+    step_entropies = []
+    step_locations = []
+    valid = mask.bool() & (step_ids >= 0)
+    for batch_idx in range(values.shape[0]):
+        batch_valid = valid[batch_idx]
+        if not torch.any(batch_valid):
+            continue
+        for step_id in torch.unique(step_ids[batch_idx][batch_valid]):
+            step_mask = batch_valid & (step_ids[batch_idx] == step_id)
+            step_entropy = values[batch_idx, step_mask].float().mean()
+            step_retrieval = retrieval_values[batch_idx, step_mask].float().mean()
+            entropy_values[batch_idx, step_mask] = step_entropy
+            step_retrieval_values[batch_idx, step_mask] = step_retrieval
+            step_entropies.append(step_entropy)
+            step_locations.append((batch_idx, step_mask))
+
+    if step_entropies:
+        normalized_steps = _normalize_vector(
+            torch.stack(step_entropies),
+            method=entropy_normalization,
+            eps=eps,
+        )
+        for norm_value, (batch_idx, step_mask) in zip(normalized_steps, step_locations):
+            normalized_entropy[batch_idx, step_mask] = norm_value
+
+    return entropy_values, normalized_entropy, step_retrieval_values
+
+
+def _expand_retrieval_hit(retrieval_hit: torch.Tensor,
+                          target: torch.Tensor,
+                          default_retrieval_hit: float):
+    if retrieval_hit is None:
+        return torch.full_like(target, default_retrieval_hit, dtype=torch.float32)
+
+    retrieval_hit = retrieval_hit.to(device=target.device, dtype=torch.float32)
+    if retrieval_hit.shape == target.shape:
+        return retrieval_hit
+    if retrieval_hit.dim() == 1 and retrieval_hit.shape[0] == target.shape[0]:
+        return retrieval_hit.unsqueeze(-1).expand_as(target)
+    if retrieval_hit.numel() == 1:
+        return retrieval_hit.reshape(1, 1).expand_as(target)
+
+    raise ValueError(
+        "retrieval_hit must be a scalar, shape (batch,), or shape (batch, response_length)"
+    )
+
+
+def compute_rce_opd_advantage(old_log_prob: torch.Tensor,
+                              teacher_log_prob: torch.Tensor,
+                              teacher_entropy: torch.Tensor,
+                              eos_mask: torch.Tensor,
+                              retrieval_hit: torch.Tensor = None,
+                              step_ids: torch.Tensor = None,
+                              advantage_mode: str = 'token',
+                              normalize: bool = False,
+                              clip_value: float = None,
+                              entropy_normalization: str = 'percentile_rank',
+                              w_min: float = 0.1,
+                              w_max: float = 1.0,
+                              alpha: float = 4.0,
+                              tau: float = 0.0,
+                              default_retrieval_hit: float = 0.5,
+                              eps: float = 1e-8,
+                              return_weights: bool = False):
+    """Compute retrieval-conditioned entropy-gated OPD advantages.
+
+    This is the sampled-token reverse-KL OPD signal multiplied by
+    ``w = w_min + (w_max - w_min) * sigmoid(alpha * (r - H_norm - tau))``.
+    When ``step_ids`` is provided, teacher entropy and retrieval reliability are
+    averaged within each step and the resulting step weight is applied back to
+    all tokens in that step. Without ``step_ids``, the whole response is treated
+    as one step per sequence, which is useful for trajectory-level retrieval-hit
+    proxies.
+    """
+    with torch.no_grad():
+        if teacher_entropy.shape != old_log_prob.shape:
+            raise ValueError("teacher_entropy must have the same shape as log probabilities")
+        if eos_mask.shape != old_log_prob.shape:
+            raise ValueError("eos_mask must have the same shape as log probabilities")
+        if not 0.0 <= w_min <= w_max:
+            raise ValueError(f"Expected 0 <= w_min <= w_max, got w_min={w_min}, w_max={w_max}")
+
+        mask = eos_mask.float()
+        retrieval_values = _expand_retrieval_hit(retrieval_hit, old_log_prob, default_retrieval_hit)
+
+        if step_ids is None:
+            entropy_values, entropy_list, entropy_indices = _compute_sequence_values(
+                teacher_entropy.float(),
+                mask,
+                default_value=0.0,
+            )
+            normalized_entropy = _normalize_sequence_values(
+                entropy_values,
+                entropy_list,
+                entropy_indices,
+                method=entropy_normalization,
+                eps=eps,
+            )
+            retrieval_values, _, _ = _compute_sequence_values(
+                retrieval_values,
+                mask,
+                default_value=default_retrieval_hit,
+            )
+        else:
+            if step_ids.shape != old_log_prob.shape:
+                raise ValueError("step_ids must have the same shape as log probabilities")
+            step_ids = step_ids.to(device=old_log_prob.device)
+            _, normalized_entropy, retrieval_values = _compute_step_values_and_normalized_entropy(
+                values=teacher_entropy.float(),
+                retrieval_values=retrieval_values,
+                mask=mask,
+                step_ids=step_ids,
+                entropy_normalization=entropy_normalization,
+                default_retrieval_hit=default_retrieval_hit,
+                eps=eps,
+            )
+        gate = torch.sigmoid(alpha * (retrieval_values - normalized_entropy - tau))
+        rce_weights = (w_min + (w_max - w_min) * gate) * mask
+
+        token_advantages = (teacher_log_prob - old_log_prob) * rce_weights
+
+        if advantage_mode == 'token':
+            advantages = token_advantages
+        elif advantage_mode == 'sequence':
+            advantages = torch.flip(
+                torch.cumsum(torch.flip(token_advantages, dims=[-1]), dim=-1),
+                dims=[-1],
+            )
+        else:
+            raise ValueError(f"Unsupported OPD advantage_mode: {advantage_mode}")
+
+        if clip_value is not None:
+            advantages = torch.clamp(advantages, min=-clip_value, max=clip_value)
+        if normalize:
+            advantages = verl_F.masked_whiten(advantages, mask)
+
+        advantages = advantages * mask
+
+    if return_weights:
+        return advantages, advantages, rce_weights
+    return advantages, advantages
+
+
 def compute_rewards(token_level_scores, old_log_prob, ref_log_prob, kl_ratio):
     kl = old_log_prob - ref_log_prob
     return token_level_scores - kl * kl_ratio

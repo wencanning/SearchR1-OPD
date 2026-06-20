@@ -1,4 +1,4 @@
-export CUDA_VISIBLE_DEVICES=1,2
+export CUDA_VISIBLE_DEVICES=3
 export NO_PROXY="${NO_PROXY:+${NO_PROXY},}127.0.0.1,localhost"
 export no_proxy="${no_proxy:+${no_proxy},}127.0.0.1,localhost"
 export DATA_DIR='data/nq_hotpotqa_train'
@@ -6,7 +6,7 @@ export TRAIN_DATA_DIR=$DATA_DIR
 export TEST_DATA_DIR=$DATA_DIR
 
 
-WAND_PROJECT='Search-R1-Eval-Teacher'
+WAND_PROJECT='Search-R1-Eval'
 
 # export BASE_MODEL='meta-llama/Llama-3.2-3B'
 # export EXPERIMENT_NAME=nq-search-r1-grpo-llama3.2-3b-em
@@ -17,8 +17,8 @@ WAND_PROJECT='Search-R1-Eval-Teacher'
 # export BASE_MODEL='meta-llama/Llama-3.1-8B-Instruct'
 # export EXPERIMENT_NAME=nq-search-r1-grpo-llama3.1-8b-it-em
 
-export BASE_MODEL=data/student
-export EXPERIMENT_NAME=search-r1-student-qwen2.5-0.5b-coldstart-eval
+export BASE_MODEL=verl_checkpoints/nq-search-r1-rcod-0.5B/actor/global_step_100
+export EXPERIMENT_NAME=rcod-rl-0.5B-eval
 # export BASE_MODEL='Qwen/Qwen2.5-3B-Instruct'
 # export EXPERIMENT_NAME=nq-search-r1-grpo-qwen2.5-3b-it-em
 # export BASE_MODEL='Qwen/Qwen2.5-7B'

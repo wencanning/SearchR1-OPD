@@ -4,7 +4,8 @@ import numpy as np
 import torch
 
 from verl import DataProto
-from verl.trainer.ppo.core_algos import compute_opd_advantage, compute_policy_loss
+from search_r1.diagnostics.opd_uncertainty import infer_evidence_step_ids, retrieval_hits_by_information_block
+from verl.trainer.ppo.core_algos import compute_opd_advantage, compute_policy_loss, compute_rce_opd_advantage
 from verl.trainer.ppo.ray_trainer import compute_advantage, compute_data_metrics, compute_opd_logprob_metrics
 from verl.utils.torch_functional import masked_mean
 
@@ -161,11 +162,110 @@ class TestOPDAdvantage(unittest.TestCase):
 
         torch.testing.assert_close(output.batch['opd_advantages'], torch.ones(2, 2))
         torch.testing.assert_close(output.batch['opd_beta'], expected_beta)
+        torch.testing.assert_close(output.batch['opd_effective_distillation_coef'], expected_beta)
         torch.testing.assert_close(output.batch['weighted_opd_advantages'], expected_beta)
         torch.testing.assert_close(
             output.batch['advantages'],
             output.batch['grpo_advantages'] + expected_beta,
         )
+
+    def test_rce_opd_weights_steps_by_retrieval_and_teacher_entropy(self):
+        student = torch.zeros(1, 4)
+        teacher = torch.ones(1, 4)
+        teacher_entropy = torch.tensor([[0.2, 0.4, 2.0, 2.2]])
+        mask = torch.ones_like(student)
+        retrieval_hit = torch.tensor([[1.0, 1.0, 0.0, 0.0]])
+        step_ids = torch.tensor([[0, 0, 1, 1]])
+
+        advantages, _, weights = compute_rce_opd_advantage(
+            old_log_prob=student,
+            teacher_log_prob=teacher,
+            teacher_entropy=teacher_entropy,
+            eos_mask=mask,
+            retrieval_hit=retrieval_hit,
+            step_ids=step_ids,
+            w_min=0.1,
+            w_max=1.0,
+            alpha=4.0,
+            tau=0.0,
+            return_weights=True,
+        )
+
+        high_weight = 0.1 + 0.9 * torch.sigmoid(torch.tensor(4.0))
+        low_weight = 0.1 + 0.9 * torch.sigmoid(torch.tensor(-4.0))
+        expected = torch.tensor([[
+            high_weight.item(),
+            high_weight.item(),
+            low_weight.item(),
+            low_weight.item(),
+        ]])
+
+        torch.testing.assert_close(weights, expected)
+        torch.testing.assert_close(advantages, expected)
+
+    def test_trainer_can_use_rce_opd_as_separate_advantage_interface(self):
+        batch = DataProto.from_dict(
+            tensors={
+                'responses': torch.ones(1, 4, dtype=torch.long),
+                'attention_mask': torch.ones(1, 6, dtype=torch.long),
+                'loss_mask': torch.ones(1, 4, dtype=torch.long),
+                'old_log_probs': torch.zeros(1, 4),
+                'ref_log_prob': torch.ones(1, 4),
+                'ref_entropy': torch.tensor([[0.2, 0.4, 2.0, 2.2]]),
+                'rce_retrieval_hit': torch.tensor([1.0]),
+                'rce_step_ids': torch.tensor([[0, 0, 1, 1]]),
+                'token_level_rewards': torch.zeros(1, 4),
+            },
+            non_tensors={'uid': np.array(['prompt'], dtype=object)},
+        )
+        batch.meta_info['opd_config'] = {
+            'advantage_mode': 'token',
+            'normalize': False,
+            'clip_value': None,
+            'distillation_coef': 2.0,
+            'grpo_reward_coef': 0.0,
+            'rce': {
+                'enable': True,
+                'entropy_normalization': 'percentile_rank',
+                'w_min': 0.1,
+                'w_max': 1.0,
+                'alpha': 4.0,
+                'tau': 0.0,
+                'default_retrieval_hit': 0.5,
+            },
+        }
+
+        output = compute_advantage(batch, 'opd')
+
+        expected_step0 = 0.1 + 0.9 * torch.sigmoid(torch.tensor(4.0))
+        expected_step1 = 0.1 + 0.9 * torch.sigmoid(torch.tensor(0.0))
+        expected = torch.tensor([[
+            expected_step0.item(),
+            expected_step0.item(),
+            expected_step1.item(),
+            expected_step1.item(),
+        ]])
+
+        torch.testing.assert_close(output.batch['opd_rce_weights'], expected)
+        torch.testing.assert_close(output.batch['opd_advantages'], expected)
+        torch.testing.assert_close(output.batch['opd_beta'], torch.ones_like(expected))
+        torch.testing.assert_close(output.batch['opd_effective_distillation_coef'], torch.full_like(expected, 2.0))
+        torch.testing.assert_close(output.batch['advantages'], 2.0 * expected)
+
+    def test_rce_metadata_helpers_track_previous_information_step(self):
+        token_texts = [
+            "<think>ask</think><search>q1</search>",
+            "<information>miss</information>",
+            "<think>use doc 1</think><search>q2</search>",
+            "<information>gold answer</information>",
+            "<think>use doc 2</think><answer>gold answer</answer>",
+        ]
+
+        step_ids = infer_evidence_step_ids(token_texts)
+        hits = retrieval_hits_by_information_block("".join(token_texts), ["gold answer"])
+
+        self.assertEqual(step_ids, [0, 0, 1, 1, 2])
+        self.assertEqual(hits, [False, True])
 
 
 class TestDualClipPPO(unittest.TestCase):
