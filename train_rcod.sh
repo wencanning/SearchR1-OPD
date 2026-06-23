@@ -3,32 +3,43 @@ set -euo pipefail
 
 export NO_PROXY="${NO_PROXY:+${NO_PROXY},}127.0.0.1,localhost"
 export no_proxy="${no_proxy:+${no_proxy},}127.0.0.1,localhost"
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4,5}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 export VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-XFORMERS}"
+export RAY_INIT_ADDRESS="${RAY_INIT_ADDRESS:-local}"
+export SEARCH_R1_PRINT_ROLLOUTS="${SEARCH_R1_PRINT_ROLLOUTS:-1}"
+export SEARCH_R1_PRINT_ROLLOUT_EVERY="${SEARCH_R1_PRINT_ROLLOUT_EVERY:-64}"
+export SEARCH_R1_PRINT_ROLLOUT_CHARS="${SEARCH_R1_PRINT_ROLLOUT_CHARS:-12000}"
 
 DATA_DIR="${DATA_DIR:-data/nq_hotpotqa_train_30k_no_cold_start}"
 TRAIN_FILE="${TRAIN_FILE:-$DATA_DIR/train.parquet}"
 VAL_FILE="${VAL_FILE:-$DATA_DIR/validation_diagnostic_512.parquet}"
 STUDENT_MODEL="${STUDENT_MODEL:-data/student}"
 TEACHER_MODEL="${TEACHER_MODEL:-/data/home/wencanning/models/SearchR1-nq_hotpotqa_train-qwen2.5-7b-it-em-grpo-v0.3}"
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-nq-search-r1-rcod}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-rcod-05b-test-w}"
 WAND_PROJECT="${WAND_PROJECT:-Search-R1-OPD}"
 N_GPUS="${N_GPUS:-$(awk -F, '{print NF}' <<< "$CUDA_VISIBLE_DEVICES")}"
-TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-200}"
+TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-151}"
 
-OPD_DISTILLATION_COEF="${OPD_DISTILLATION_COEF:-1.0}"
-OPD_GRPO_REWARD_COEF="${OPD_GRPO_REWARD_COEF:-1.0}"
-OPD_USE_GATED_DISTILLATION="${OPD_USE_GATED_DISTILLATION:-true}"
+FORMAT_STRUCTURE_SCORE="${FORMAT_STRUCTURE_SCORE:-0.0}"
+FORMAT_FINAL_SCORE="${FORMAT_FINAL_SCORE:-0.0}"
+FORMAT_RETRIEVAL_SCORE="${FORMAT_RETRIEVAL_SCORE:-0.0}"
+
+OPD_DISTILLATION_COEF="${OPD_DISTILLATION_COEF:-0.5}"
+# Distillation-only training: keep the teacher OPD signal, but do not mix in
+# rule/GRPO outcome rewards.
+OPD_GRPO_REWARD_COEF=0.0
+OPD_USE_GATED_DISTILLATION="${OPD_USE_GATED_DISTILLATION:-false}"
 OPD_GATE_GAMMA="${OPD_GATE_GAMMA:-1.0}"
 OPD_GATE_BETA_MIN="${OPD_GATE_BETA_MIN:-0.0}"
 OPD_GATE_BETA_MAX="${OPD_GATE_BETA_MAX:-0.05}"
-OPD_N_AGENT="${OPD_N_AGENT:-8}"
+OPD_N_AGENT="${OPD_N_AGENT:-1}"
 
+# RCOD相关参数
 OPD_RCE_ENABLE="${OPD_RCE_ENABLE:-true}"
 OPD_RCE_ENTROPY_NORMALIZATION="${OPD_RCE_ENTROPY_NORMALIZATION:-percentile_rank}"
-OPD_RCE_W_MIN="${OPD_RCE_W_MIN:-0.1}"
-OPD_RCE_W_MAX="${OPD_RCE_W_MAX:-1.0}"
-OPD_RCE_ALPHA="${OPD_RCE_ALPHA:-4.0}"
+OPD_RCE_W_MIN="${OPD_RCE_W_MIN:-0.5}"
+OPD_RCE_W_MAX="${OPD_RCE_W_MAX:-1.5}"
+OPD_RCE_ALPHA="${OPD_RCE_ALPHA:-3.0}"
 OPD_RCE_TAU="${OPD_RCE_TAU:-0.0}"
 OPD_RCE_DEFAULT_RETRIEVAL_HIT="${OPD_RCE_DEFAULT_RETRIEVAL_HIT:-0.5}"
 
@@ -39,11 +50,11 @@ OPD_DIAGNOSTICS_MAX_SEQUENCES="${OPD_DIAGNOSTICS_MAX_SEQUENCES:-64}"
 OPD_DIAGNOSTICS_SAMPLE_STRATEGY="${OPD_DIAGNOSTICS_SAMPLE_STRATEGY:-random}"
 OPD_DIAGNOSTICS_COMPRESS="${OPD_DIAGNOSTICS_COMPRESS:-false}"
 
-PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
+PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo_format \
     data.train_files="$TRAIN_FILE" \
     data.val_files="$VAL_FILE" \
-    data.train_batch_size=128 \
-    data.val_batch_size=256 \
+    data.train_batch_size=256 \
+    data.val_batch_size=512 \
     data.max_prompt_length=5120 \
     data.max_response_length=512 \
     data.max_start_length=2048 \
@@ -73,6 +84,9 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     algorithm.opd.diagnostics.sample_strategy="$OPD_DIAGNOSTICS_SAMPLE_STRATEGY" \
     algorithm.opd.diagnostics.compress="$OPD_DIAGNOSTICS_COMPRESS" \
     algorithm.no_think_rl=false \
+    reward_model.structure_format_score="$FORMAT_STRUCTURE_SCORE" \
+    reward_model.final_format_score="$FORMAT_FINAL_SCORE" \
+    reward_model.retrieval_score="$FORMAT_RETRIEVAL_SCORE" \
     actor_rollout_ref.model.path="$STUDENT_MODEL" \
     actor_rollout_ref.ref.model_path="$TEACHER_MODEL" \
     actor_rollout_ref.model.enable_gradient_checkpointing=true \

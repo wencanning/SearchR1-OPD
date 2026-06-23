@@ -6,7 +6,12 @@ import torch
 from verl import DataProto
 from search_r1.diagnostics.opd_uncertainty import infer_evidence_step_ids, retrieval_hits_by_information_block
 from verl.trainer.ppo.core_algos import compute_opd_advantage, compute_policy_loss, compute_rce_opd_advantage
-from verl.trainer.ppo.ray_trainer import compute_advantage, compute_data_metrics, compute_opd_logprob_metrics
+from verl.trainer.ppo.ray_trainer import (
+    _build_rce_retrieval_hit_values,
+    compute_advantage,
+    compute_data_metrics,
+    compute_opd_logprob_metrics,
+)
 from verl.utils.torch_functional import masked_mean
 
 
@@ -266,6 +271,15 @@ class TestOPDAdvantage(unittest.TestCase):
 
         self.assertEqual(step_ids, [0, 0, 1, 1, 2])
         self.assertEqual(hits, [False, True])
+
+    def test_rce_retrieval_hit_defaults_only_before_first_retrieval(self):
+        values = _build_rce_retrieval_hit_values(
+            evidence_step_ids=[0, 0, 1, 1, 2, 3],
+            block_hits=[False, True],
+            pre_retrieval_hit=0.5,
+        )
+
+        self.assertEqual(values, [0.5, 0.5, 0.0, 0.0, 1.0, 0.0])
 
 
 class TestDualClipPPO(unittest.TestCase):

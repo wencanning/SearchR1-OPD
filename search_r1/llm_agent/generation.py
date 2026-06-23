@@ -1,5 +1,6 @@
 import torch
 import re
+import random
 from collections import defaultdict
 import os
 from typing import List, Dict, Any, Tuple
@@ -60,6 +61,36 @@ class LLMGenerationManager:
         trajectory = self.tokenizer.decode(response_ids[0], skip_special_tokens=True)
         print("\n[validation trajectory] complete sample")
         print(trajectory)
+
+    def _print_training_trajectories(self, response_ids: torch.Tensor) -> None:
+        if self.is_validation or response_ids.shape[0] == 0:
+            return
+
+        try:
+            num_samples = int(os.environ.get("SEARCH_R1_PRINT_ROLLOUTS", "0"))
+        except ValueError:
+            num_samples = 0
+        if num_samples <= 0:
+            return
+
+        try:
+            sample_every = int(os.environ.get("SEARCH_R1_PRINT_ROLLOUT_EVERY", "64"))
+        except ValueError:
+            sample_every = 64
+        if sample_every > 1 and random.randint(1, sample_every) != 1:
+            return
+
+        try:
+            max_chars = int(os.environ.get("SEARCH_R1_PRINT_ROLLOUT_CHARS", "12000"))
+        except ValueError:
+            max_chars = 12000
+
+        for sample_idx in range(min(num_samples, response_ids.shape[0])):
+            trajectory = self.tokenizer.decode(response_ids[sample_idx], skip_special_tokens=True)
+            if max_chars > 0 and len(trajectory) > max_chars:
+                trajectory = trajectory[:max_chars] + "\n...[truncated]"
+            print(f"\n[train trajectory] sample={sample_idx}")
+            print(trajectory)
 
     def _batch_tokenize(self, responses: List[str]) -> torch.Tensor:
         """Tokenize a batch of responses."""
@@ -281,6 +312,7 @@ class LLMGenerationManager:
         turns_stats = torch.ones(gen_batch.batch['input_ids'].shape[0], dtype=torch.int)
         valid_action_stats = torch.zeros(gen_batch.batch['input_ids'].shape[0], dtype=torch.int)
         valid_search_stats = torch.zeros(gen_batch.batch['input_ids'].shape[0], dtype=torch.int)
+        invalid_action_stats = torch.zeros(gen_batch.batch['input_ids'].shape[0], dtype=torch.int)
         active_num_list = [active_mask.sum().item()]
         rollings = gen_batch
 
@@ -304,8 +336,11 @@ class LLMGenerationManager:
             responses_ids, responses_str = self.tensor_fn._example_level_pad(responses_ids, responses_str, active_mask)
 
             # Execute in environment and process observations
-            next_obs, dones, valid_action, is_search = self.execute_predictions(
-                responses_str, self.tokenizer.pad_token, active_mask
+            next_obs, dones, valid_action, is_search, invalid_action = self.execute_predictions(
+                responses_str,
+                self.tokenizer.pad_token,
+                active_mask,
+                invalid_action_stats,
             )
             self._print_validation_step(step, responses_str, next_obs)
             
@@ -315,6 +350,7 @@ class LLMGenerationManager:
             turns_stats[curr_active_mask] += 1
             valid_action_stats += torch.tensor(valid_action, dtype=torch.int)
             valid_search_stats += torch.tensor(is_search, dtype=torch.int)
+            invalid_action_stats += torch.tensor(invalid_action, dtype=torch.int)
 
             next_obs_ids = self._process_next_obs(next_obs)
             
@@ -348,8 +384,12 @@ class LLMGenerationManager:
             responses_ids, responses_str = self.tensor_fn._example_level_pad(responses_ids, responses_str, active_mask)
 
             # # Execute in environment and process observations
-            _, dones, valid_action, is_search = self.execute_predictions(
-                responses_str, self.tokenizer.pad_token, active_mask, do_search=False
+            _, dones, valid_action, is_search, invalid_action = self.execute_predictions(
+                responses_str,
+                self.tokenizer.pad_token,
+                active_mask,
+                invalid_action_stats,
+                do_search=False,
             )
 
             curr_active_mask = torch.tensor([not done for done in dones], dtype=torch.bool)
@@ -357,6 +397,7 @@ class LLMGenerationManager:
             active_num_list.append(active_mask.sum().item())
             valid_action_stats += torch.tensor(valid_action, dtype=torch.int)
             valid_search_stats += torch.tensor(is_search, dtype=torch.int)
+            invalid_action_stats += torch.tensor(invalid_action, dtype=torch.int)
             
 
             original_right_side = self._update_right_side(
@@ -368,11 +409,13 @@ class LLMGenerationManager:
         meta_info['active_mask'] = active_mask.tolist()
         meta_info['valid_action_stats'] = valid_action_stats.tolist()
         meta_info['valid_search_stats'] = valid_search_stats.tolist()
+        meta_info['invalid_action_stats'] = invalid_action_stats.tolist()
         
         print("ACTIVE_TRAJ_NUM:", active_num_list)
         
         final_output = self._compose_final_output(original_left_side, original_right_side, meta_info)
         self._print_validation_trajectory(final_output.batch['responses'])
+        self._print_training_trajectories(final_output.batch['responses'])
         return final_output
 
     def _compose_final_output(self, left_side: Dict,
@@ -407,7 +450,15 @@ class LLMGenerationManager:
         
         return final_output
 
-    def execute_predictions(self, predictions: List[str], pad_token: str, active_mask=None, do_search=True) -> List[str]:
+    def execute_predictions(
+        self,
+        predictions: List[str],
+        pad_token: str,
+        active_mask=None,
+        invalid_action_counts=None,
+        do_search=True,
+        max_invalid_action_retries: int = 1,
+    ) -> Tuple[List[str], List[int], List[int], List[int], List[int]]:
         """
         Execute predictions across multiple environments.
         NOTE: the function is the actual `step` function in the environment
@@ -422,10 +473,12 @@ class LLMGenerationManager:
             List of observation strings
         """
         cur_actions, contents = self.postprocess_predictions(predictions)
-        next_obs, dones, valid_action, is_search = [], [], [], []
+        next_obs, dones, valid_action, is_search, invalid_action = [], [], [], [], []
+        if invalid_action_counts is None:
+            invalid_action_counts = [0] * len(predictions)
         
         search_queries = [content for action, content in zip(cur_actions, contents) if action == 'search']
-        if do_search:
+        if do_search and search_queries:
             search_results = self.batch_search(search_queries)
             assert len(search_results) == sum([1 for action in cur_actions if action == 'search'])
         else:
@@ -438,28 +491,37 @@ class LLMGenerationManager:
                 dones.append(1)
                 valid_action.append(0)
                 is_search.append(0)
+                invalid_action.append(0)
             else:
                 if action == 'answer':
                     next_obs.append('')
                     dones.append(1)
                     valid_action.append(1)
                     is_search.append(0)
+                    invalid_action.append(0)
                 elif action == 'search':
                     next_obs.append(f'\n\n<information>{search_results.pop(0).strip()}</information>\n\n')
                     dones.append(0)
                     valid_action.append(1)
                     is_search.append(1)
+                    invalid_action.append(0)
                 else:
-                    next_obs.append(f'\nMy previous action is invalid. \
-If I want to search, I should put the query between <search> and </search>. \
-If I want to give the final answer, I should put the answer between <answer> and </answer>. Let me try again.\n')
-                    dones.append(0)
+                    invalid_action.append(1)
                     valid_action.append(0)
                     is_search.append(0)
+                    invalid_count = int(invalid_action_counts[i])
+                    if (not do_search) or invalid_count >= max_invalid_action_retries:
+                        next_obs.append('')
+                        dones.append(1)
+                    else:
+                        next_obs.append(f'\nMy previous action is invalid. \
+	If I want to search, I should put the query between <search> and </search>. \
+	If I want to give the final answer, I should put the answer between <answer> and </answer>. Let me try again.\n')
+                        dones.append(0)
             
         assert len(search_results) == 0
             
-        return next_obs, dones, valid_action, is_search
+        return next_obs, dones, valid_action, is_search, invalid_action
 
     def postprocess_predictions(self, predictions: List[Any]) -> Tuple[List[int], List[bool]]:
         """

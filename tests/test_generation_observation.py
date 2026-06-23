@@ -43,6 +43,49 @@ class ObservationProcessingTest(unittest.TestCase):
         self.assertEqual(len(decoded), self.manager.config.max_obs_length)
         self.assertEqual(decoded, observation[:self.manager.config.max_obs_length])
 
+    def test_allows_one_invalid_action_retry(self):
+        next_obs, dones, valid_action, is_search, invalid_action = self.manager.execute_predictions(
+            ["not a tagged action"],
+            pad_token="",
+            active_mask=[True],
+            invalid_action_counts=[0],
+        )
+
+        self.assertIn("My previous action is invalid", next_obs[0])
+        self.assertEqual(dones, [0])
+        self.assertEqual(valid_action, [0])
+        self.assertEqual(is_search, [0])
+        self.assertEqual(invalid_action, [1])
+
+    def test_second_invalid_action_terminates(self):
+        next_obs, dones, valid_action, is_search, invalid_action = self.manager.execute_predictions(
+            ["still not tagged"],
+            pad_token="",
+            active_mask=[True],
+            invalid_action_counts=[1],
+        )
+
+        self.assertEqual(next_obs, [""])
+        self.assertEqual(dones, [1])
+        self.assertEqual(valid_action, [0])
+        self.assertEqual(is_search, [0])
+        self.assertEqual(invalid_action, [1])
+
+    def test_final_rollout_invalid_action_terminates_without_retry(self):
+        next_obs, dones, valid_action, is_search, invalid_action = self.manager.execute_predictions(
+            ["not tagged on final rollout"],
+            pad_token="",
+            active_mask=[True],
+            invalid_action_counts=[0],
+            do_search=False,
+        )
+
+        self.assertEqual(next_obs, [""])
+        self.assertEqual(dones, [1])
+        self.assertEqual(valid_action, [0])
+        self.assertEqual(is_search, [0])
+        self.assertEqual(invalid_action, [1])
+
 
 if __name__ == "__main__":
     unittest.main()

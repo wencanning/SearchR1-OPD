@@ -110,6 +110,19 @@ def compute_opd_logprob_metrics(old_log_probs: torch.Tensor,
     }
 
 
+def _build_rce_retrieval_hit_values(evidence_step_ids, block_hits, pre_retrieval_hit: float) -> list[float]:
+    """Map decoded Search-R1 step ids to token-level retrieval-hit values."""
+    values = []
+    for step_id in evidence_step_ids:
+        if step_id == 0:
+            values.append(float(pre_retrieval_hit))
+        elif block_hits is not None and step_id - 1 < len(block_hits):
+            values.append(float(block_hits[step_id - 1]))
+        else:
+            values.append(0.0)
+    return values
+
+
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty='kl'):
     responses = data.batch['responses']
     response_length = responses.size(1)
@@ -377,6 +390,9 @@ def compute_data_metrics(batch, use_critic=True):
         metrics['env/ratio_of_valid_action'] = float((np.array(batch.meta_info['valid_action_stats'], dtype=np.int16) / np.array(batch.meta_info['turns_stats'], dtype=np.int16)).mean())
     if 'valid_search_stats' in batch.meta_info:
         metrics['env/number_of_valid_search'] = float(np.array(batch.meta_info['valid_search_stats'], dtype=np.int16).mean())
+    if 'invalid_action_stats' in batch.meta_info:
+        metrics['env/number_of_invalid_action'] = float(
+            np.array(batch.meta_info['invalid_action_stats'], dtype=np.int16).mean())
 
 
     return metrics
@@ -450,7 +466,7 @@ class RayPPOTrainer(object):
         self.ray_worker_group_cls = ray_worker_group_cls
         self.opd_diagnostics = None
 
-        if self.use_opd:
+        if self.use_opd and not self.config.trainer.get('val_only', False):
             assert self.use_reference_policy, 'OPD requires a teacher/reference policy'
             assert not config.actor_rollout_ref.actor.use_kl_loss, \
                 'OPD uses the teacher signal directly; actor.use_kl_loss must be false'
@@ -560,8 +576,11 @@ class RayPPOTrainer(object):
         Accumulates metrics across all batches before computing final statistics.
         """
         import torch
+        import time
         reward_tensor_lst = []
         data_source_lst = []
+        total_val_steps = len(self.val_dataloader)
+        print(f'[validation] total batches: {total_val_steps}')
 
         gen_config = GenerationConfig(
             max_turns=self.config.max_turns,
@@ -584,7 +603,9 @@ class RayPPOTrainer(object):
         )
 
         if not self.config.do_search:
-            for test_data in self.val_dataloader:
+            for val_step, test_data in enumerate(self.val_dataloader, start=1):
+                batch_start_time = time.perf_counter()
+                print(f'[validation] running batch {val_step}/{total_val_steps}')
                 test_batch = DataProto.from_single_dict(test_data)
 
                 # we only do validation on rule-based rm
@@ -615,8 +636,12 @@ class RayPPOTrainer(object):
 
                 reward_tensor_lst.append(reward_tensor)
                 data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
+                elapsed = time.perf_counter() - batch_start_time
+                print(f'[validation] completed batch {val_step}/{total_val_steps} elapsed_s={elapsed:.3f}')
         else:
-            for batch_dict in self.val_dataloader:
+            for val_step, batch_dict in enumerate(self.val_dataloader, start=1):
+                batch_start_time = time.perf_counter()
+                print(f'[validation] running batch {val_step}/{total_val_steps}')
                 timing_raw = {}
                 test_batch: DataProto = DataProto.from_single_dict(batch_dict)
                 # test_batch = test_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n_agent, interleave=True)
@@ -649,6 +674,11 @@ class RayPPOTrainer(object):
 
                     reward_tensor_lst.append(reward_tensor)
                     data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
+                    elapsed = time.perf_counter() - batch_start_time
+                    print(
+                        f'[validation] completed batch {val_step}/{total_val_steps} '
+                        f'elapsed_s={elapsed:.3f}'
+                    )
 
         reward_tensor = torch.cat([rw.sum(-1) for rw in reward_tensor_lst], dim=0).cpu()  # (batch_size,)
         # reward_tensor = torch.cat(reward_tensor_lst, dim=0).sum(-1).cpu()  # (batch_size,)
@@ -777,13 +807,13 @@ class RayPPOTrainer(object):
         response_length = batch.batch['responses'].size(-1)
         response_mask = batch.batch['attention_mask'][:, -response_length:]
         rce_config = self.config.algorithm.opd.get('rce', {})
-        default_retrieval_hit = float(rce_config.get('default_retrieval_hit', 0.5))
+        pre_retrieval_hit = float(rce_config.get('default_retrieval_hit', 0.5))
 
         step_ids = torch.full_like(batch.batch['responses'], -1, dtype=torch.long)
-        retrieval_hit = torch.full_like(batch.batch['responses'], default_retrieval_hit, dtype=torch.float32)
+        retrieval_hit = torch.zeros_like(batch.batch['responses'], dtype=torch.float32)
         sequence_retrieval_hit = torch.full(
             (batch.batch['responses'].shape[0],),
-            default_retrieval_hit,
+            0.0,
             dtype=torch.float32,
         )
         retrieval_hit_known = torch.zeros_like(sequence_retrieval_hit, dtype=torch.bool)
@@ -805,13 +835,20 @@ class RayPPOTrainer(object):
             decoded_response = "".join(token_texts)
             sequence_hit = _retrieval_hit(decoded_response, targets)
             block_hits = retrieval_hits_by_information_block(decoded_response, targets)
+            if evidence_step_ids:
+                hit_values = _build_rce_retrieval_hit_values(
+                    evidence_step_ids,
+                    block_hits,
+                    pre_retrieval_hit,
+                )
+                retrieval_hit[seq_idx, :valid_len] = torch.tensor(
+                    hit_values,
+                    dtype=torch.float32,
+                    device=retrieval_hit.device,
+                )
             if sequence_hit is not None:
                 sequence_retrieval_hit[seq_idx] = float(sequence_hit)
                 retrieval_hit_known[seq_idx] = True
-            if block_hits is not None:
-                for token_idx, step_id in enumerate(evidence_step_ids):
-                    if step_id > 0 and step_id - 1 < len(block_hits):
-                        retrieval_hit[seq_idx, token_idx] = float(block_hits[step_id - 1])
 
         batch.batch['rce_step_ids'] = step_ids
         batch.batch['rce_retrieval_hit'] = retrieval_hit
@@ -983,7 +1020,10 @@ class RayPPOTrainer(object):
                                 batch.batch['token_level_scores'] = reward_tensor
                                 batch.batch['token_level_rewards'] = reward_tensor
                             else:
-                                batch.batch['token_level_scores'] = opd_scores
+                                # Keep rule/EM scores for logging only. Pure OPD training
+                                # still uses the teacher-student log-prob signal below.
+                                reward_tensor = self.reward_fn(batch)
+                                batch.batch['token_level_scores'] = reward_tensor
                                 batch.batch['token_level_rewards'] = opd_scores
                             batch.meta_info['opd_config'] = {
                                 'advantage_mode': self.config.algorithm.opd.advantage_mode,

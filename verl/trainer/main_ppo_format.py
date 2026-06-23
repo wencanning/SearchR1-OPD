@@ -16,6 +16,7 @@ Note that we don't combine the main with ray_trainer as ray_trainer is used by o
 """
 
 from verl import DataProto
+import os
 import torch
 from verl.utils.reward_score import qa_em, qa_em_format
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
@@ -105,7 +106,9 @@ import hydra
 def main(config):
     if not ray.is_initialized():
         # this is for local ray cluster
-        ray.init(runtime_env={'env_vars': {'TOKENIZERS_PARALLELISM': 'true', 'NCCL_DEBUG': 'WARN'}})
+        ray_init_address = os.environ.get("RAY_INIT_ADDRESS", "local")
+        ray.init(address=ray_init_address,
+                 runtime_env={'env_vars': {'TOKENIZERS_PARALLELISM': 'true', 'NCCL_DEBUG': 'WARN'}})
 
     ray.get(main_task.remote(config))
 

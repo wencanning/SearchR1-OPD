@@ -116,6 +116,11 @@ experiment runnable with the existing rollout data while preserving the
 tensor can be passed to the same interface as `rce_retrieval_hit` without
 changing the loss implementation.
 
+For trainer-created RCE metadata, `default_retrieval_hit` is used only for
+step-0 tokens before the first retrieval. Other tokens default to `0.0` unless a
+previous `<information>...</information>` block provides an explicit hit/miss
+value.
+
 The plain OPD diagnostics support this direction:
 
 - 25,088 retained trajectories had retrieval hit rate 0.620, so hit/miss states
