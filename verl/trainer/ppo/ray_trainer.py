@@ -1334,7 +1334,7 @@ class RayPPOTrainer(object):
                             metrics,
                             mask_protocol_tags=bool(
                                 self.config.algorithm.opd.get(
-                                    'mask_protocol_tags', True
+                                    'mask_protocol_tags', False
                                 )
                             ),
                         )
@@ -1622,13 +1622,13 @@ class RayPPOTrainer(object):
         self,
         batch: DataProto,
         metrics: dict,
-        mask_protocol_tags: bool = True,
+        mask_protocol_tags: bool = False,
     ):
         """Build an OPD-only mask without changing the RL action mask.
 
-        Search-R1 protocol tags remain in ``loss_mask`` so GRPO can train valid
-        formatting.  They are removed only from ``opd_distillation_mask`` to
-        prevent teacher tokenization preferences from shifting student tags.
+        Search-R1 protocol tags are tracked independently for diagnostics. By
+        default they remain in ``opd_distillation_mask`` and receive normal OPD;
+        the optional mask is retained only for explicit ablation runs.
         """
         response_length = batch.batch['responses'].shape[-1]
         response_mask = batch.batch['attention_mask'][:, -response_length:]

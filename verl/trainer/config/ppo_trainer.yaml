@@ -192,8 +192,8 @@ algorithm:
     normalize: False
     clip_value: null
     distillation_coef: 1.0
-    # Keep protocol syntax trainable by outcome RL, but do not distill it.
-    mask_protocol_tags: true
+    # Distill protocol syntax by default; masking tags can create a zero-OPD escape route.
+    mask_protocol_tags: false
     # Fixed coefficient used by evidence_residual and entropy_matched targets.
     # Null preserves distillation_coef for existing OPD configurations.
     lambda_distill: null

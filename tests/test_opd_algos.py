@@ -161,7 +161,9 @@ class TestOPDAdvantage(unittest.TestCase):
         trainer = RayPPOTrainer.__new__(RayPPOTrainer)
         trainer.tokenizer = CharacterTokenizer()
 
-        output, metrics = trainer._create_opd_distillation_mask(batch, {})
+        output, metrics = trainer._create_opd_distillation_mask(
+            batch, {}, mask_protocol_tags=True
+        )
 
         kept_text = ''.join(
             char
@@ -175,6 +177,10 @@ class TestOPDAdvantage(unittest.TestCase):
         self.assertTrue(torch.all(output.batch['loss_mask'] == 1))
         self.assertEqual(metrics['opd/config/mask_protocol_tags'], 1.0)
         self.assertGreater(metrics['opd/protocol_tag_token_fraction'], 0.0)
+
+        output, metrics = trainer._create_opd_distillation_mask(batch, {})
+        self.assertTrue(torch.all(output.batch['opd_distillation_mask'] == 1))
+        self.assertEqual(metrics['opd/config/mask_protocol_tags'], 0.0)
 
     def test_opd_divergence_matches_sod_absolute_logprob_gap(self):
         old_log_probs = torch.tensor([[-2.0, -20.0, -3.0]])
