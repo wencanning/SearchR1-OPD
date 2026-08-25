@@ -113,6 +113,7 @@ class ActorRolloutRefWorker(Worker):
                                fsdp_config,
                                optim_config,
                                override_model_config,
+                               attn_implementation='flash_attention_2',
                                use_remove_padding=False,
                                enable_gradient_checkpointing=False,
                                trust_remote_code=False):
@@ -164,7 +165,7 @@ class ActorRolloutRefWorker(Worker):
             actor_module = AutoModelForCausalLM.from_pretrained(pretrained_model_name_or_path=local_path,
                                                                 torch_dtype=torch_dtype,
                                                                 config=actor_model_config,
-                                                                attn_implementation='flash_attention_2',
+                                                                attn_implementation=attn_implementation,
                                                                 trust_remote_code=trust_remote_code)
             # some parameters may not in torch_dtype. TODO(zhangchi.usc1992) remove this after we switch to fsdp2
             actor_module.to(torch_dtype)
@@ -305,6 +306,7 @@ class ActorRolloutRefWorker(Worker):
                 fsdp_config=fsdp_config,
                 optim_config=optim_config,
                 override_model_config=override_model_config,
+                attn_implementation=self.config.model.get('attn_implementation', 'flash_attention_2'),
                 use_remove_padding=use_remove_padding,
                 enable_gradient_checkpointing=self.config.model.get('enable_gradient_checkpointing', False),
                 trust_remote_code=self.config.model.get('trust_remote_code', False))
@@ -324,11 +326,20 @@ class ActorRolloutRefWorker(Worker):
             OmegaConf.set_struct(self.config.actor, True)
             with open_dict(self.config.actor):
                 self.config.actor.use_remove_padding = use_remove_padding
+                self.config.actor.logit_vocab_size = (
+                    len(self.tokenizer)
+                    if self.config.rollout.get('restrict_to_tokenizer_vocab', False)
+                    else None
+                )
             self.actor = DataParallelPPOActor(config=self.config.actor,
                                               actor_module=self.actor_module_fsdp,
                                               actor_optimizer=self.actor_optimizer)
 
         if self._is_rollout:
+            OmegaConf.set_struct(self.config.rollout, True)
+            with open_dict(self.config.rollout):
+                self.config.rollout.logit_vocab_size = len(self.tokenizer)
+                self.config.rollout.model_vocab_size = self.actor_model_config.vocab_size
             self.rollout, self.rollout_sharding_manager = self._build_rollout()
 
         if self._is_ref:
@@ -337,6 +348,11 @@ class ActorRolloutRefWorker(Worker):
                                                                fsdp_config=self.config.ref.fsdp_config,
                                                                optim_config=None,
                                                                override_model_config=override_model_config,
+                                                               attn_implementation=self.config.ref.get(
+                                                                   'attn_implementation',
+                                                                   self.config.model.get(
+                                                                       'attn_implementation',
+                                                                       'flash_attention_2')),
                                                                use_remove_padding=use_remove_padding,
                                                                trust_remote_code=self.config.model.get(
                                                                    'trust_remote_code', False))[0]
@@ -346,6 +362,11 @@ class ActorRolloutRefWorker(Worker):
             OmegaConf.set_struct(self.config.ref, True)
             with open_dict(self.config.ref):
                 self.config.ref.use_remove_padding = use_remove_padding
+                self.config.ref.logit_vocab_size = (
+                    len(self.tokenizer)
+                    if self.config.rollout.get('restrict_to_tokenizer_vocab', False)
+                    else None
+                )
             self.ref_policy = DataParallelPPOActor(config=self.config.ref, actor_module=self.ref_module_fsdp)
 
         if self._is_actor:
@@ -503,11 +524,21 @@ class ActorRolloutRefWorker(Worker):
         data.meta_info['use_dynamic_bsz'] = self.config.ref.log_prob_use_dynamic_bsz
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data)
-            ref_log_prob, ref_entropy = self.ref_policy.compute_log_prob(data=data, return_entropy=True)
-            output = DataProto.from_dict(tensors={
-                'ref_log_prob': ref_log_prob,
-                'ref_entropy': ref_entropy,
-            })
+            target_mode = data.meta_info.get('opd_teacher_target', 'observed')
+            if target_mode == 'observed':
+                ref_log_prob, ref_entropy = self.ref_policy.compute_log_prob(data=data, return_entropy=True)
+                output_tensors = {
+                    'ref_log_prob': ref_log_prob,
+                    'ref_entropy': ref_entropy,
+                }
+            else:
+                output_tensors = self.ref_policy.compute_teacher_target_log_prob(
+                    data=data,
+                    target_mode=target_mode,
+                    entropy_matched_tau=data.meta_info.get('opd_entropy_matched_tau'),
+                    token_chunk_size=data.meta_info.get('opd_target_token_chunk_size', 16),
+                )
+            output = DataProto.from_dict(tensors=output_tensors)
             output = self.ulysses_sharding_manager.postprocess_data(output)
 
         output = output.to('cpu')

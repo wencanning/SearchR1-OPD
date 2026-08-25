@@ -2,6 +2,9 @@ data:
   tokenizer: null
   train_files: ~/data/rlhf/gsm8k/train.parquet
   val_files: ~/data/rlhf/gsm8k/test.parquet
+  # Optional exact-match filter on the parquet data_source column.
+  train_data_source: null
+  val_data_source: null
   train_data_num: null
   val_data_num: null
   prompt_key: prompt
@@ -20,6 +23,7 @@ actor_rollout_ref:
   model:
     path: ~/models/deepseek-llm-7b-chat
     external_lib: null
+    attn_implementation: flash_attention_2
     override_config: { }
     enable_gradient_checkpointing: False
     use_remove_padding: False
@@ -61,8 +65,27 @@ actor_rollout_ref:
   ref:
     # Optional independent teacher checkpoint. Defaults to actor model.path.
     model_path: null
+    # Evidence interventions require sdpa so a per-sample 4D additive mask is honored.
+    attn_implementation: flash_attention_2
+    # Strict ER/control launchers override all three precision settings to FP32.
+    target_forward_dtype: bfloat16
+    # Non-FP32 target logits are an explicit speed/precision tradeoff. ER
+    # residual construction and vocabulary normalization still run in FP32.
+    allow_approximate_target_precision: False
+    # Exact target-path optimizations. Selection skips LM-head rows excluded by
+    # loss_mask; trimming removes only prompt columns padded for the whole batch.
+    target_select_policy_logits: True
+    target_trim_shared_prompt_padding: True
+    # A100 TensorFloat-32 acceleration for FP32 teacher matrix multiplications.
+    # Output logits and ER normalization remain FP32.
+    allow_tf32: False
     fsdp_config:
+      model_dtype: null
       param_offload: False
+      mixed_precision:
+        param_dtype: bf16
+        reduce_dtype: fp32
+        buffer_dtype: fp32
       wrap_policy:
         # transformer_layer_cls_to_wrap: None
         min_num_params: 0
@@ -74,6 +97,9 @@ actor_rollout_ref:
   rollout:
     name: vllm
     temperature: 1.0
+    seed: null
+    # Intervened OPD targets require sampling only from tokenizer-defined IDs.
+    restrict_to_tokenizer_vocab: False
     top_k: -1 # 0 for hf rollout, -1 for vllm rollout
     top_p: 0.95
     prompt_length: ${data.max_prompt_length}  # not use for opensource
@@ -166,6 +192,14 @@ algorithm:
     normalize: False
     clip_value: null
     distillation_coef: 1.0
+    # Fixed coefficient used by evidence_residual and entropy_matched targets.
+    # Null preserves distillation_coef for existing OPD configurations.
+    lambda_distill: null
+    # observed: ordinary teacher; evidence_residual: softmax(2*z_obs-z_hidden);
+    # entropy_matched: softmax(z_obs/tau) with one pre-calibrated global tau.
+    teacher_target: observed
+    entropy_matched_tau: null
+    target_token_chunk_size: 16
     # Set > 0 to add group-normalized Search-R1 outcome reward to OPD.
     grpo_reward_coef: 0.0
     # Gate token-level distillation by task advantage for OPD+RL.
@@ -216,6 +250,15 @@ trainer:
   critic_warmup: 0
   default_hdfs_dir: ~/experiments/gsm8k/ppo/${trainer.experiment_name}
   default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
+  er_entropy_calibration:
+    enable: False
+    fraction: 0.05
+    split_seed: 42
+    decode_seed: 42
+    data_source: hotpotqa
+    entropy_tolerance: 1.0e-6
+    relative_temperature_tolerance: 1.0e-8
+    output_path: refine-logs/ER_ENTROPY_CALIBRATION.json
 
 max_turns: 10
 do_search: true

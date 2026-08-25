@@ -14,7 +14,43 @@
 """Utils for tokenization."""
 import warnings
 
-__all__ = ['hf_tokenizer']
+__all__ = [
+    'hf_tokenizer',
+    'mask_logits_to_tokenizer_vocab',
+    'mask_vllm_logits_to_tokenizer_vocab',
+    'validate_same_model_vocab',
+    'validate_same_tokenizer_vocab',
+]
+
+
+def mask_logits_to_tokenizer_vocab(token_ids, logits, *, vocab_size):
+    """Mask padded model-head rows while retaining tokenizer added tokens.
+
+    vLLM's ``allowed_token_ids`` validates against ``tokenizer.vocab_size``,
+    which excludes added tokens for Hugging Face tokenizers.  OPD instead uses
+    ``len(tokenizer)`` as the shared coordinate space, so apply the upper-bound
+    mask directly to the model logits.
+    """
+    del token_ids
+    if vocab_size <= 0 or vocab_size > logits.shape[-1]:
+        raise ValueError(
+            f'shared tokenizer vocabulary {vocab_size} is incompatible with '
+            f'rollout logits width {logits.shape[-1]}'
+        )
+    logits[..., vocab_size:] = float('-inf')
+    return logits
+
+
+def mask_vllm_logits_to_tokenizer_vocab(vocab_size, prompt_token_ids, token_ids, logits):
+    """vLLM three-argument adapter for the shared-vocabulary mask.
+
+    vLLM 0.6.3 decides whether to call a logits processor with two or three
+    positional arguments by inspecting its signature.  Bind ``vocab_size`` as
+    the leading positional argument with ``functools.partial`` so the resulting
+    callable has exactly ``(prompt_token_ids, token_ids, logits)``.
+    """
+    del prompt_token_ids
+    return mask_logits_to_tokenizer_vocab(token_ids, logits, vocab_size=vocab_size)
 
 
 def set_pad_token_id(tokenizer):
@@ -56,3 +92,35 @@ def hf_tokenizer(name_or_path, correct_pad_token=True, correct_gemma2=True, **kw
     if correct_pad_token:
         set_pad_token_id(tokenizer)
     return tokenizer
+
+
+def validate_same_tokenizer_vocab(student_tokenizer, teacher_tokenizer):
+    """Fail unless two tokenizers have exactly aligned integer coordinates."""
+    if len(student_tokenizer) != len(teacher_tokenizer):
+        raise ValueError(
+            'OPD requires identical tokenizer lengths: '
+            f'{len(student_tokenizer)} != {len(teacher_tokenizer)}'
+        )
+
+    token_ids = list(range(len(student_tokenizer)))
+    if student_tokenizer.convert_ids_to_tokens(token_ids) != teacher_tokenizer.convert_ids_to_tokens(token_ids):
+        raise ValueError('OPD tokenizer id-to-token coordinates differ between student and teacher')
+
+    if list(student_tokenizer.get_added_vocab().items()) != list(teacher_tokenizer.get_added_vocab().items()):
+        raise ValueError('OPD tokenizer added-token order differs between student and teacher')
+
+    if student_tokenizer.all_special_ids != teacher_tokenizer.all_special_ids:
+        raise ValueError('OPD tokenizer special-token ids differ between student and teacher')
+    if student_tokenizer.special_tokens_map != teacher_tokenizer.special_tokens_map:
+        raise ValueError('OPD tokenizer special-token maps differ between student and teacher')
+
+
+def validate_same_model_vocab(student_config, teacher_config, tokenizer):
+    """Ensure both padded model heads cover the complete shared tokenizer V."""
+    shared_vocab_size = len(tokenizer)
+    for role, config in (('student', student_config), ('teacher', teacher_config)):
+        if shared_vocab_size > config.vocab_size:
+            raise ValueError(
+                f'OPD shared tokenizer V exceeds the {role} model output: '
+                f'{shared_vocab_size} > {config.vocab_size}'
+            )

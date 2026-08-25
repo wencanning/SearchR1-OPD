@@ -1,4 +1,4 @@
-export CUDA_VISIBLE_DEVICES=0,1
+export CUDA_VISIBLE_DEVICES=2,3
 
 file_path=./data/retriever_root/wiki18
 index_file=$file_path/e5_Flat.index

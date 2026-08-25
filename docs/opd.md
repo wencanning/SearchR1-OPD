@@ -87,6 +87,94 @@ gate setting:
 combined_advantage = distillation_coef * opd_advantage
 ```
 
+## Evidence-Residual OPD
+
+Evidence-Residual OPD (ER-OPD) is an OPD teacher-target variant. It does not
+use DGPO, gates, thresholds, or token-dependent weights. It can be run as pure
+distillation or combined with vanilla GRPO outcome advantages. For every
+student policy-token row, the frozen teacher is evaluated
+twice on the same token ids and position ids:
+
+```text
+z_observed = teacher(full student trajectory)
+z_hidden   = teacher(same trajectory, retrieved-content key columns blocked)
+q_ER       = softmax(2 * z_observed - z_hidden)
+```
+
+The hidden pass uses a per-sample 4D additive causal mask. Text inside
+`<information>...</information>` is hidden at every layer; the boundary tags,
+sequence slots, causal order, padding, and position ids remain unchanged. The
+two passes are independent and do not share a KV cache.
+
+Strict ER/control runs load the teacher with FP32 FSDP parameters and produce
+FP32 logits for both paired passes. Approximate target precision is rejected
+unless `ref.allow_approximate_target_precision=true`. The optimized
+`train_er_opd.sh` launcher explicitly opts into FP16 teacher parameters and
+paired forwards; the evidence residual, full-vocabulary log-softmax, entropy,
+and sampled-token extraction are still computed in FP32. This mode is labeled
+separately because it is a measured speed/precision tradeoff, not bitwise
+equivalent to the strict target. The reference worker returns only sampled-token
+`log q_ER` plus audit metrics. This is exactly
+the quantity needed by the existing on-policy K1 reverse-KL estimator and
+avoids transferring an `[policy_tokens, vocab_size]` tensor through Ray. Target
+normalization is chunked over token rows, never over the vocabulary.
+Here `vocab_size` is the exact shared tokenizer coordinate set; unused padded
+rows in differently sized Qwen output heads are excluded from both student and
+teacher normalization.
+Policy-token coverage follows executed Search-R1 trajectories: all retained
+reasoning/search/answer tokens and a sampled final-answer EOS are included.
+Suffixes sampled after an action-closing tag are rollout-engine over-generation
+and are discarded before the action is executed.
+
+ER-OPD enforces the following target invariants at startup:
+
+- token-mode OPD with no whitening or clipping;
+- one fixed positive `lambda_distill` and one PPO epoch;
+- `rollout.temperature=1`, `state_masking=true`, and teacher SDPA attention;
+- exact student/teacher id-to-token, added-token, and special-token alignment;
+- one global mean over valid policy tokens across micro-batches and GPUs.
+
+With `grpo_reward_coef>0`, the trainer requires more than one rollout per
+question and combines the two signals as
+`lambda_distill * ER_advantage + grpo_reward_coef * GRPO_advantage`. With
+`grpo_reward_coef=0`, it instead requires exactly one rollout and one full-batch
+optimizer update, preserving the stricter pure-distillation control.
+
+The dedicated ER launcher filters the mixed training parquet to
+`data_source=hotpotqa`. By default it validates on the original unfiltered
+`data/nq_hotpotqa_train/test.parquet` benchmark used by Search-R1; set
+`VAL_FILE` and/or `VAL_DATA_SOURCE` to override that behavior. The generic
+`train_opd.sh` keeps its configured validation path unless overridden.
+
+Run it with:
+
+```bash
+DATA_DIR=/path/to/hotpotqa \
+STUDENT_MODEL=/path/to/Qwen2.5-1.5B-Instruct \
+TEACHER_MODEL=/path/to/Qwen2.5-7B-Instruct \
+./train_er_opd.sh
+```
+
+### Entropy-matched control
+
+The matched control uses the same policy-token rows and fixed coefficient but
+replaces the target with `softmax(z_observed / tau)`. `tau` must be calibrated
+once on the declared frozen-student calibration split and then passed unchanged:
+
+```bash
+./calibrate_er_entropy.sh
+ENTROPY_MATCHED_TAU=0.73 ./train_entropy_matched_opd.sh
+```
+
+Calibration writes both a timestamped audit record and the fixed
+`refine-logs/ER_ENTROPY_CALIBRATION.json`; copy its printed temperature into
+`ENTROPY_MATCHED_TAU` for the control run.
+
+`verl.utils.evidence_residual` provides deterministic 5% calibration-id
+selection and an automatically bracketed bounded Brent solver in log-temperature
+space. The caller supplies a streaming mean-entropy function, so calibration
+does not require retaining full-vocabulary logits for the entire split in RAM.
+
 ## Retrieval-Conditioned Entropy Gate
 
 RCE-OPD adds a separate tensor-level interface,

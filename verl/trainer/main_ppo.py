@@ -143,12 +143,14 @@ def main_task(config):
 
         teacher_local_path = copy_local_path_from_hdfs(teacher_path)
         teacher_tokenizer = hf_tokenizer(teacher_local_path)
-        special_token_ids = ('bos_token_id', 'eos_token_id', 'pad_token_id')
-        tokenizers_match = tokenizer.get_vocab() == teacher_tokenizer.get_vocab() and all(
-            getattr(tokenizer, key) == getattr(teacher_tokenizer, key) for key in special_token_ids
+        from transformers import AutoConfig
+        from verl.utils.tokenizer import validate_same_model_vocab, validate_same_tokenizer_vocab
+        validate_same_tokenizer_vocab(tokenizer, teacher_tokenizer)
+        validate_same_model_vocab(
+            AutoConfig.from_pretrained(local_path),
+            AutoConfig.from_pretrained(teacher_local_path),
+            tokenizer,
         )
-        if not tokenizers_match:
-            raise ValueError('OPD requires the student and teacher to use the same tokenizer and special token IDs')
 
     # define worker classes
     if config.actor_rollout_ref.actor.strategy == 'fsdp':

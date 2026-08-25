@@ -17,12 +17,15 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import os
+import copy
+import hashlib
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from pprint import pprint
 from typing import Type, Dict
+from datetime import datetime
 
 import re
 import json
@@ -38,6 +41,10 @@ from verl.single_controller.ray import RayResourcePool, RayWorkerGroup, RayClass
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.ppo import core_algos
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
+from verl.utils.evidence_residual import (
+    calibrate_entropy_matched_temperature,
+    select_calibration_ids,
+)
 
 import re
 from search_r1.diagnostics.opd_uncertainty import OPDUncertaintyDumper
@@ -429,6 +436,107 @@ def _timer(name: str, timing_raw: Dict[str, float]):
     timing_raw[name] = timer.last
 
 
+def validate_opd_teacher_target_config(config):
+    """Validate invariants that keep intervened targets as the only variable."""
+    opd_config = config.algorithm.opd
+    target_mode = opd_config.get('teacher_target', 'observed')
+    supported_modes = {'observed', 'evidence_residual', 'entropy_matched'}
+    if target_mode not in supported_modes:
+        raise ValueError(f'Unsupported OPD teacher_target: {target_mode}')
+    if target_mode == 'observed':
+        return
+
+    if not config.do_search:
+        raise ValueError(f'{target_mode} requires search-agent trajectories')
+    if not config.actor_rollout_ref.actor.state_masking:
+        raise ValueError(f'{target_mode} requires state_masking=true')
+    if opd_config.advantage_mode != 'token':
+        raise ValueError(f'{target_mode} requires advantage_mode=token for equal token coverage')
+    if opd_config.normalize:
+        raise ValueError(f'{target_mode} requires normalize=false')
+    if opd_config.clip_value is not None:
+        raise ValueError(f'{target_mode} requires clip_value=null')
+    grpo_reward_coef = float(opd_config.get('grpo_reward_coef', 0.0))
+    if grpo_reward_coef < 0:
+        raise ValueError(f'{target_mode} requires grpo_reward_coef>=0')
+    if opd_config.get('rce', {}).get('enable', False):
+        raise ValueError(f'{target_mode} requires all RCE/token-weighting paths to be disabled')
+    if config.actor_rollout_ref.actor.entropy_coeff != 0:
+        raise ValueError(f'{target_mode} requires actor entropy_coeff=0')
+    if config.actor_rollout_ref.actor.ppo_epochs != 1:
+        raise ValueError(f'{target_mode} requires ppo_epochs=1')
+    rollout_group_size = (
+        config.actor_rollout_ref.rollout.n
+        * config.actor_rollout_ref.rollout.n_agent
+    )
+    if grpo_reward_coef > 0:
+        if rollout_group_size <= 1:
+            raise ValueError(
+                f'{target_mode}+GRPO requires more than one rollout per question'
+            )
+    else:
+        if rollout_group_size != 1:
+            raise ValueError(
+                f'pure {target_mode} requires exactly one on-policy trajectory per question'
+            )
+        if config.actor_rollout_ref.actor.ppo_mini_batch_size != config.data.train_batch_size:
+            raise ValueError(
+                f'pure {target_mode} requires ppo_mini_batch_size=train_batch_size so the update '
+                'is one global mean over all policy tokens'
+            )
+    if config.actor_rollout_ref.rollout.temperature != 1.0:
+        raise ValueError(f'{target_mode} requires rollout.temperature=1.0 so teacher logits are unscaled')
+    if not config.actor_rollout_ref.rollout.get('restrict_to_tokenizer_vocab', False):
+        raise ValueError(f'{target_mode} requires rollout.restrict_to_tokenizer_vocab=true')
+    if config.actor_rollout_ref.ref.attn_implementation != 'sdpa':
+        raise ValueError(f'{target_mode} requires ref.attn_implementation=sdpa')
+    if config.actor_rollout_ref.ref.ulysses_sequence_parallel_size != 1:
+        raise ValueError(f'{target_mode} requires ref.ulysses_sequence_parallel_size=1')
+    fp32_aliases = {'32', 'fp32', 'float32'}
+    fp16_aliases = {'16', 'fp16', 'float16'}
+    bf16_aliases = {'bf16', 'bfloat16'}
+    ref_fsdp_config = config.actor_rollout_ref.ref.fsdp_config
+    precision_settings = {
+        'ref.fsdp_config.model_dtype': str(ref_fsdp_config.get('model_dtype')).lower(),
+        'ref.fsdp_config.mixed_precision.param_dtype': str(
+            ref_fsdp_config.mixed_precision.param_dtype
+        ).lower(),
+        'ref.target_forward_dtype': str(
+            config.actor_rollout_ref.ref.get('target_forward_dtype')
+        ).lower(),
+    }
+    allow_approximate_precision = bool(
+        config.actor_rollout_ref.ref.get('allow_approximate_target_precision', False)
+    )
+    if allow_approximate_precision:
+        precision_family = None
+        for aliases in (fp16_aliases, bf16_aliases):
+            if all(value in aliases for value in precision_settings.values()):
+                precision_family = aliases
+                break
+        if precision_family is None:
+            raise ValueError(
+                f'{target_mode} approximate teacher precision requires model, mixed-precision, '
+                f'and forward dtypes to consistently use FP16 or BF16; got {precision_settings}'
+            )
+    else:
+        for name, value in precision_settings.items():
+            if value not in fp32_aliases:
+                raise ValueError(
+                    f'{target_mode} requires {name}=fp32 unless '
+                    'ref.allow_approximate_target_precision=true'
+                )
+    lambda_distill = opd_config.get('lambda_distill')
+    if lambda_distill is None or lambda_distill <= 0:
+        raise ValueError(f'{target_mode} requires a positive fixed lambda_distill')
+    if opd_config.get('target_token_chunk_size', 0) <= 0:
+        raise ValueError('target_token_chunk_size must be positive')
+    if target_mode == 'entropy_matched':
+        tau = opd_config.get('entropy_matched_tau')
+        if tau is None or tau <= 0:
+            raise ValueError('entropy_matched requires a positive pre-calibrated entropy_matched_tau')
+
+
 class RayPPOTrainer(object):
     """
     Note that this trainer runs on the driver process on a single CPU/GPU node.
@@ -472,6 +580,7 @@ class RayPPOTrainer(object):
                 'OPD uses the teacher signal directly; actor.use_kl_loss must be false'
             assert not config.do_search or config.actor_rollout_ref.actor.state_masking, \
                 'Search OPD requires actor.state_masking=true to exclude observation tokens'
+            validate_opd_teacher_target_config(config)
             if config.algorithm.opd.grpo_reward_coef != 0:
                 group_size = config.actor_rollout_ref.rollout.n_agent * config.actor_rollout_ref.rollout.n
                 assert group_size > 1, 'OPD + GRPO reward requires more than one rollout per prompt'
@@ -517,6 +626,15 @@ class RayPPOTrainer(object):
                                          filter_prompts=True,
                                          return_raw_chat=self.config.data.get('return_raw_chat', False),
                                          truncation='error')
+        train_data_source = self.config.data.get('train_data_source')
+        if train_data_source:
+            if 'data_source' not in self.train_dataset.dataframe.columns:
+                raise ValueError('data.train_data_source requires a data_source parquet column')
+            self.train_dataset.dataframe = self.train_dataset.dataframe[
+                self.train_dataset.dataframe['data_source'] == train_data_source
+            ].copy()
+            if self.train_dataset.dataframe.empty:
+                raise ValueError(f'no training rows found for data_source={train_data_source!r}')
         if self.config.data.train_data_num is not None:
             if self.config.data.train_data_num > len(self.train_dataset.dataframe):
                 print(f"[WARNING] training dataset size is smaller than desired size. Using the dataset as the original size {len(self.train_dataset.dataframe)}")
@@ -537,6 +655,15 @@ class RayPPOTrainer(object):
                                        filter_prompts=True,
                                        return_raw_chat=self.config.data.get('return_raw_chat', False),
                                        truncation='error')
+        val_data_source = self.config.data.get('val_data_source')
+        if val_data_source:
+            if 'data_source' not in self.val_dataset.dataframe.columns:
+                raise ValueError('data.val_data_source requires a data_source parquet column')
+            self.val_dataset.dataframe = self.val_dataset.dataframe[
+                self.val_dataset.dataframe['data_source'] == val_data_source
+            ].copy()
+            if self.val_dataset.dataframe.empty:
+                raise ValueError(f'no validation rows found for data_source={val_data_source!r}')
         if self.config.data.val_data_num is not None:
             if self.config.data.val_data_num > len(self.val_dataset.dataframe):
                 print(f"[WARNING] validation dataset size is smaller than desired size. Using the dataset as the original size {len(self.val_dataset.dataframe)}")
@@ -547,7 +674,7 @@ class RayPPOTrainer(object):
         self.val_dataloader = DataLoader(dataset=self.val_dataset,
                                          batch_size=self.config.data.val_batch_size,
                                          shuffle=False,
-                                         drop_last=True,
+                                         drop_last=False,
                                          collate_fn=collate_fn)
 
         print(f'Size of train dataloader: {len(self.train_dataloader)}')
@@ -785,6 +912,190 @@ class RayPPOTrainer(object):
                 self.config.trainer.default_hdfs_dir, 'critic')
             self.critic_wg.save_checkpoint(critic_local_path, critic_remote_path)
 
+    def _score_calibration_entropy(self, calibration_batches, target_mode, tau=None):
+        entropy_sum = 0.0
+        observed_entropy_sum = 0.0
+        token_count = 0
+        for calibration_batch, pad_size in calibration_batches:
+            calibration_batch.meta_info['opd_teacher_target'] = target_mode
+            calibration_batch.meta_info['opd_entropy_matched_tau'] = tau
+            calibration_batch.meta_info['opd_target_token_chunk_size'] = \
+                self.config.algorithm.opd.get('target_token_chunk_size', 16)
+            output = self.ref_policy_wg.compute_ref_log_prob(calibration_batch)
+            valid_output = unpad_dataproto(output, pad_size)
+            valid_batch = unpad_dataproto(calibration_batch, pad_size)
+            policy_mask = valid_batch.batch['loss_mask'].float()
+            entropy_sum += (valid_output.batch['ref_entropy'] * policy_mask).sum().item()
+            if 'ref_observed_entropy' in valid_output.batch:
+                observed_entropy_sum += (
+                    valid_output.batch['ref_observed_entropy'] * policy_mask
+                ).sum().item()
+            token_count += int(policy_mask.sum().item())
+        if token_count == 0:
+            raise ValueError('entropy calibration collected no policy-token rows')
+        return {
+            'mean_entropy': entropy_sum / token_count,
+            'mean_observed_entropy': observed_entropy_sum / token_count,
+            'token_count': token_count,
+        }
+
+    def _run_er_entropy_calibration(self, generation_manager):
+        """Collect frozen-student rows once and fit one auditable global tau."""
+        from torch.utils.data import DataLoader
+        from verl.utils.dataset.rl_dataset import collate_fn
+
+        calibration_config = self.config.trainer.er_entropy_calibration
+        if self.config.algorithm.opd.teacher_target != 'evidence_residual':
+            raise ValueError('ER entropy calibration must run with teacher_target=evidence_residual')
+        if self.config.actor_rollout_ref.rollout.seed != calibration_config.decode_seed:
+            raise ValueError('rollout.seed must equal er_entropy_calibration.decode_seed')
+
+        dataframe = self.train_dataset.dataframe
+        data_source = calibration_config.get('data_source')
+        if data_source:
+            dataframe = dataframe[dataframe['data_source'] == data_source]
+        if dataframe.empty:
+            raise ValueError(f'no training questions found for calibration data_source={data_source!r}')
+        if 'id' not in dataframe.columns:
+            raise ValueError('entropy calibration requires a stable question id column')
+
+        selected_ids = select_calibration_ids(
+            dataframe['id'].astype(str).tolist(),
+            seed=calibration_config.split_seed,
+            fraction=calibration_config.fraction,
+        )
+        selection_order = {question_id: idx for idx, question_id in enumerate(selected_ids)}
+        selected_dataframe = dataframe[
+            dataframe['id'].astype(str).isin(selection_order)
+        ].copy()
+        selected_dataframe['_calibration_order'] = selected_dataframe['id'].astype(str).map(selection_order)
+        selected_dataframe = selected_dataframe.sort_values('_calibration_order').drop(
+            columns=['_calibration_order'])
+
+        calibration_dataset = copy.copy(self.train_dataset)
+        calibration_dataset.dataframe = selected_dataframe
+        calibration_loader = DataLoader(
+            dataset=calibration_dataset,
+            batch_size=self.config.data.train_batch_size,
+            shuffle=False,
+            drop_last=False,
+            collate_fn=collate_fn,
+        )
+
+        calibration_batches = []
+        trajectory_count = 0
+        for batch_dict in calibration_loader:
+            batch = DataProto.from_single_dict(batch_dict)
+            trajectory_count += len(batch)
+            batch.non_tensor_batch['uid'] = np.array(
+                [str(uuid.uuid4()) for _ in range(len(batch))],
+                dtype=object,
+            )
+            gen_batch = batch.pop(batch_keys=['input_ids', 'attention_mask', 'position_ids'])
+            first_input_ids = gen_batch.batch['input_ids'][
+                :, -self.config.data.max_start_length:
+            ].clone().long()
+            final_output = generation_manager.run_llm_loop(
+                gen_batch=gen_batch,
+                initial_input_ids=first_input_ids,
+            )
+            for key in final_output.batch.keys():
+                final_output.batch[key] = final_output.batch[key].long()
+            batch = batch.union(final_output)
+            batch, _ = self._create_loss_mask(batch, {})
+            scoring_batch = DataProto.from_dict(tensors={
+                key: batch.batch[key]
+                for key in (
+                    'responses',
+                    'input_ids',
+                    'attention_mask',
+                    'position_ids',
+                    'evidence_mask',
+                    'loss_mask',
+                )
+            })
+            scoring_batch, pad_size = pad_dataproto_to_divisor(
+                scoring_batch,
+                self.ref_policy_wg.world_size,
+            )
+            calibration_batches.append((scoring_batch, pad_size))
+
+        er_stats = self._score_calibration_entropy(
+            calibration_batches,
+            target_mode='evidence_residual',
+        )
+
+        def mean_visible_entropy(temperature):
+            return self._score_calibration_entropy(
+                calibration_batches,
+                target_mode='entropy_matched',
+                tau=temperature,
+            )['mean_entropy']
+
+        result = calibrate_entropy_matched_temperature(
+            mean_visible_entropy,
+            target_entropy=er_stats['mean_entropy'],
+            entropy_tolerance=calibration_config.entropy_tolerance,
+            relative_temperature_tolerance=calibration_config.relative_temperature_tolerance,
+        )
+        fingerprint_payload = {
+            'selected_question_ids': selected_ids,
+            'split_seed': int(calibration_config.split_seed),
+            'decode_seed': int(calibration_config.decode_seed),
+            'student_model': str(self.config.actor_rollout_ref.model.path),
+            'teacher_model': str(self.config.actor_rollout_ref.ref.model_path),
+            'shared_vocab_size': len(self.tokenizer),
+        }
+        calibration_fingerprint = hashlib.sha256(
+            json.dumps(
+                fingerprint_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(',', ':'),
+            ).encode('utf-8')
+        ).hexdigest()
+        artifact = {
+            'schema_version': 1,
+            'created_at': datetime.now().astimezone().isoformat(),
+            'method': 'ER-OPD entropy-matched control calibration',
+            'student_model': str(self.config.actor_rollout_ref.model.path),
+            'teacher_model': str(self.config.actor_rollout_ref.ref.model_path),
+            'shared_vocab_size': len(self.tokenizer),
+            'data_source': data_source,
+            'fraction': float(calibration_config.fraction),
+            'split_seed': int(calibration_config.split_seed),
+            'decode_seed': int(calibration_config.decode_seed),
+            'selection_rule': 'seeded crc32 rank of question ids with lexical tie-break',
+            'calibration_fingerprint_sha256': calibration_fingerprint,
+            'selected_question_ids': selected_ids,
+            'selected_question_count': len(selected_ids),
+            'trajectory_count': trajectory_count,
+            'policy_token_count': er_stats['token_count'],
+            'er_mean_entropy': er_stats['mean_entropy'],
+            'visible_mean_entropy_at_tau_1': er_stats['mean_observed_entropy'],
+            'temperature': result.temperature,
+            'matched_mean_entropy': result.achieved_entropy,
+            'entropy_gap': result.entropy_gap,
+            'entropy_tolerance': float(calibration_config.entropy_tolerance),
+            'relative_temperature_tolerance': float(
+                calibration_config.relative_temperature_tolerance),
+            'solver_evaluations': result.evaluations,
+            'stop_reason': result.stop_reason,
+        }
+
+        output_path = os.path.abspath(os.path.expanduser(calibration_config.output_path))
+        output_dir = os.path.dirname(output_path)
+        os.makedirs(output_dir, exist_ok=True)
+        stem, extension = os.path.splitext(output_path)
+        timestamped_path = f"{stem}_{datetime.now().strftime('%Y%m%d_%H%M%S')}{extension}"
+        for path in (timestamped_path, output_path):
+            with open(path, 'w', encoding='utf-8') as output_file:
+                json.dump(artifact, output_file, ensure_ascii=False, indent=2)
+                output_file.write('\n')
+        print(f'ER entropy calibration saved: {timestamped_path}')
+        print(f'Use ENTROPY_MATCHED_TAU={result.temperature:.12g}')
+        return artifact
+
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix='global_seqlen'):
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
         attention_mask = batch.batch['attention_mask']
@@ -911,6 +1222,10 @@ class RayPPOTrainer(object):
             config=gen_config,
         )
 
+        if self.config.trainer.er_entropy_calibration.get('enable', False):
+            self._run_er_entropy_calibration(generation_manager)
+            return
+
         # start training loop
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
@@ -992,9 +1307,21 @@ class RayPPOTrainer(object):
                         if key not in float_batch_keys:
                             batch.batch[key] = batch.batch[key].long()
 
+                    if self.use_opd and self.config.do_search and self.config.actor_rollout_ref.actor.state_masking:
+                        batch, metrics = self._create_loss_mask(batch, metrics)
+
                     if self.use_reference_policy:
                         # compute reference log_prob
                         with _timer('ref', timing_raw):
+                            if self.use_opd:
+                                teacher_target = self.config.algorithm.opd.get('teacher_target', 'observed')
+                                if teacher_target == 'evidence_residual' and 'evidence_mask' not in batch.batch:
+                                    raise ValueError('evidence_residual target requires rollout evidence_mask')
+                                batch.meta_info['opd_teacher_target'] = teacher_target
+                                batch.meta_info['opd_entropy_matched_tau'] = \
+                                    self.config.algorithm.opd.get('entropy_matched_tau')
+                                batch.meta_info['opd_target_token_chunk_size'] = \
+                                    self.config.algorithm.opd.get('target_token_chunk_size', 16)
                             ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
 
@@ -1004,8 +1331,6 @@ class RayPPOTrainer(object):
                             values = self.critic_wg.compute_values(batch)
                             batch = batch.union(values)
 
-                    if self.use_opd and self.config.do_search and self.config.actor_rollout_ref.actor.state_masking:
-                        batch, metrics = self._create_loss_mask(batch, metrics)
                     if self.use_opd and self.config.algorithm.opd.get('rce', {}).get('enable', False):
                         batch, metrics = self._create_rce_metadata(batch, metrics)
 
@@ -1025,11 +1350,16 @@ class RayPPOTrainer(object):
                                 reward_tensor = self.reward_fn(batch)
                                 batch.batch['token_level_scores'] = reward_tensor
                                 batch.batch['token_level_rewards'] = opd_scores
+                            lambda_distill = self.config.algorithm.opd.get('lambda_distill')
+                            if lambda_distill is None:
+                                lambda_distill = self.config.algorithm.opd.distillation_coef
                             batch.meta_info['opd_config'] = {
                                 'advantage_mode': self.config.algorithm.opd.advantage_mode,
                                 'normalize': self.config.algorithm.opd.normalize,
                                 'clip_value': self.config.algorithm.opd.clip_value,
-                                'distillation_coef': self.config.algorithm.opd.distillation_coef,
+                                'distillation_coef': lambda_distill,
+                                'lambda_distill': lambda_distill,
+                                'teacher_target': self.config.algorithm.opd.get('teacher_target', 'observed'),
                                 'grpo_reward_coef': self.config.algorithm.opd.grpo_reward_coef,
                                 'use_gated_distillation': self.config.algorithm.opd.get('use_gated_distillation', True),
                                 'gamma': self.config.algorithm.opd.get('gamma', 1.0),
@@ -1047,6 +1377,31 @@ class RayPPOTrainer(object):
                                 batch.batch['ref_entropy'],
                                 opd_mask,
                             ).item()
+                            teacher_target = self.config.algorithm.opd.get('teacher_target', 'observed')
+                            metrics['opd/teacher_target_is_intervened'] = float(
+                                teacher_target != 'observed')
+                            if teacher_target == 'entropy_matched':
+                                metrics['opd/entropy_matched_tau'] = float(
+                                    self.config.algorithm.opd.entropy_matched_tau)
+                            if teacher_target == 'evidence_residual':
+                                evidence_mask = batch.batch['evidence_mask'].float()
+                                valid_context = batch.batch['attention_mask'].float()
+                                metrics['opd/evidence_context_token_fraction'] = (
+                                    evidence_mask.sum() / valid_context.sum()
+                                ).item()
+                                metrics['opd/evidence_trajectory_rate'] = (
+                                    evidence_mask.bool().any(dim=-1).float().mean()
+                                ).item()
+                                metrics['opd/observed_teacher_entropy'] = masked_mean(
+                                    batch.batch['ref_observed_entropy'], opd_mask).item()
+                                metrics['opd/hidden_teacher_entropy'] = masked_mean(
+                                    batch.batch['ref_hidden_entropy'], opd_mask).item()
+                                metrics['opd/er_logprob_shift'] = masked_mean(
+                                    batch.batch['ref_log_prob'] - batch.batch['ref_observed_log_prob'],
+                                    opd_mask,
+                                ).item()
+                                metrics['opd/selected_logit_residual'] = masked_mean(
+                                    batch.batch['ref_selected_logit_delta'], opd_mask).item()
                             if 'old_entropy' in batch.batch:
                                 metrics['opd/student_entropy'] = masked_mean(
                                     batch.batch['old_entropy'],
@@ -1153,6 +1508,10 @@ class RayPPOTrainer(object):
                             if not self.use_opd and self.config.do_search and \
                                     self.config.actor_rollout_ref.actor.state_masking:
                                 batch, metrics = self._create_loss_mask(batch, metrics)
+                            batch.meta_info['token_level_loss_normalization'] = bool(
+                                self.use_opd
+                                and self.config.algorithm.opd.get('teacher_target', 'observed') != 'observed'
+                            )
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
                         if self.use_opd and 'actor/entropy_loss' in actor_output_metrics:

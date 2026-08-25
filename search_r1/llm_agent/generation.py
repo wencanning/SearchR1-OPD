@@ -103,7 +103,7 @@ class LLMGenerationManager:
 
     def _postprocess_responses(self, responses: torch.Tensor) -> torch.Tensor:
         """Process responses to stop at search operation or answer operation."""
-        responses_str = self.tokenizer.batch_decode(
+        decoded_responses = self.tokenizer.batch_decode(
             responses, 
             skip_special_tokens=True
         )
@@ -113,7 +113,7 @@ class LLMGenerationManager:
                  else resp.split('</answer>')[0] + '</answer>'
                  if '</answer>' in resp 
                  else resp
-                 for resp in responses_str]
+                 for resp in decoded_responses]
 
         if self.config.no_think_rl:
             raise ValueError('stop')
@@ -121,59 +121,167 @@ class LLMGenerationManager:
             actions, _ = self.env.postprocess_predictions(responses_str)
             responses_str=[f"<answer>{envs[idx].ACTION_LOOKUP[action]}</answer>" for idx, action in enumerate(actions)]
             print("RESPONSES:", responses_str)
-        responses = self._batch_tokenize(responses_str)
+        processed_ids = []
+        eos_token_id = self.tokenizer.eos_token_id
+        pad_token_id = self.tokenizer.pad_token_id
+        closing_tag_ids = {
+            tag: self.tokenizer(tag, add_special_tokens=False)['input_ids']
+            for tag in ('</search>', '</answer>')
+        }
+
+        def find_subsequence(sequence, subsequence):
+            if not subsequence:
+                return None
+            for start in range(len(sequence) - len(subsequence) + 1):
+                if sequence[start:start + len(subsequence)] == subsequence:
+                    return start + len(subsequence)
+            return None
+
+        for row_idx, (decoded_response, response_str) in enumerate(
+                zip(decoded_responses, responses_str)):
+            raw_ids = responses[row_idx].tolist()
+            if pad_token_id != eos_token_id:
+                while raw_ids and raw_ids[-1] == pad_token_id:
+                    raw_ids.pop()
+
+            closing_tag = (
+                '</search>' if '</search>' in response_str
+                else '</answer>' if '</answer>' in response_str
+                else None
+            )
+            closing_end = (
+                find_subsequence(raw_ids, closing_tag_ids[closing_tag])
+                if closing_tag is not None else None
+            )
+            if closing_tag is None:
+                response_ids = raw_ids
+            elif closing_end is not None:
+                # Preserve the student's exact sampled tokenization through the
+                # executed action boundary.  Only an EOS sampled immediately
+                # after a final answer is part of that executed trajectory.
+                response_ids = raw_ids[:closing_end]
+                if (
+                    closing_tag == '</answer>'
+                    and closing_end < len(raw_ids)
+                    and raw_ids[closing_end] == eos_token_id
+                ):
+                    response_ids.append(eos_token_id)
+            else:
+                # Tokenizers can theoretically merge across a tag boundary.
+                # Fall back to exact text re-tokenization, but never move an EOS
+                # across discarded decoded suffix text.
+                response_ids = self.tokenizer(
+                    response_str,
+                    add_special_tokens=False,
+                )['input_ids']
+                if (
+                    closing_tag == '</answer>'
+                    and decoded_response == response_str
+                    and eos_token_id is not None
+                    and eos_token_id in raw_ids
+                ):
+                    response_ids.append(eos_token_id)
+            processed_ids.append(torch.tensor(response_ids, dtype=torch.long))
+        responses = torch.nn.utils.rnn.pad_sequence(
+            processed_ids,
+            batch_first=True,
+            padding_value=self.tokenizer.pad_token_id,
+        )
         return responses, responses_str
 
-    def _process_next_obs(self, next_obs: List[str]) -> torch.Tensor:
-        """Process next observations from environment."""
+    def _tokenize_observation_with_evidence_mask(self, observation: str) -> Tuple[List[int], List[int]]:
+        """Tokenize an observation and mark only retrieved-content tokens.
+
+        The marker tokens remain visible to an intervened teacher.  A token is
+        marked when its character offsets overlap text inside an
+        ``<information>...</information>`` pair.  Keeping this annotation next
+        to tokenization avoids reconstructing evidence spans from decoded text.
+        """
         information_start = "<information>"
         information_end = "</information>"
+        encoded = self.tokenizer(
+            observation,
+            add_special_tokens=False,
+            return_offsets_mapping=True,
+        )
+        observation_ids = list(encoded['input_ids'])
+        offsets = list(encoded['offset_mapping'])
+
+        content_spans = []
+        cursor = 0
+        while True:
+            start_index = observation.find(information_start, cursor)
+            if start_index < 0:
+                break
+            content_start = start_index + len(information_start)
+            end_index = observation.find(information_end, content_start)
+            if end_index < 0:
+                break
+            content_spans.append((content_start, end_index))
+            cursor = end_index + len(information_end)
+
+        evidence_mask = [
+            int(
+                token_end > token_start
+                and any(token_start < span_end and token_end > span_start
+                        for span_start, span_end in content_spans)
+            )
+            for token_start, token_end in offsets
+        ]
+
+        if len(observation_ids) <= self.config.max_obs_length:
+            return observation_ids, evidence_mask
+
+        if not content_spans:
+            return (
+                observation_ids[:self.config.max_obs_length],
+                evidence_mask[:self.config.max_obs_length],
+            )
+
+        fixed_indices = [idx for idx, is_evidence in enumerate(evidence_mask) if not is_evidence]
+        content_budget = self.config.max_obs_length - len(fixed_indices)
+        if content_budget < 0:
+            raise ValueError(
+                "max_obs_length is too small to preserve the visible "
+                "<information> and </information> boundary tokens"
+            )
+        evidence_indices = [idx for idx, is_evidence in enumerate(evidence_mask) if is_evidence]
+        keep = set(fixed_indices + evidence_indices[:content_budget])
+        kept_indices = [idx for idx in range(len(observation_ids)) if idx in keep]
+        return (
+            [observation_ids[idx] for idx in kept_indices],
+            [evidence_mask[idx] for idx in kept_indices],
+        )
+
+    def _process_next_obs(self, next_obs: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Process observations and their aligned retrieved-content masks."""
         processed_obs_ids = []
+        processed_evidence_masks = []
 
         for observation in next_obs:
-            observation_ids = self.tokenizer(
-                observation,
-                add_special_tokens=False,
-            )['input_ids']
-
-            if len(observation_ids) > self.config.max_obs_length:
-                start_index = observation.find(information_start)
-                end_index = observation.rfind(information_end)
-                if start_index >= 0 and end_index >= start_index + len(information_start):
-                    prefix_ids = self.tokenizer(
-                        observation[:start_index + len(information_start)],
-                        add_special_tokens=False,
-                    )['input_ids']
-                    content_ids = self.tokenizer(
-                        observation[start_index + len(information_start):end_index],
-                        add_special_tokens=False,
-                    )['input_ids']
-                    suffix_ids = self.tokenizer(
-                        observation[end_index:],
-                        add_special_tokens=False,
-                    )['input_ids']
-                    content_length = self.config.max_obs_length - len(prefix_ids) - len(suffix_ids)
-                    if content_length < 0:
-                        raise ValueError(
-                            "max_obs_length is too small to preserve "
-                            "<information> and </information>"
-                        )
-                    observation_ids = prefix_ids + content_ids[:content_length] + suffix_ids
-                else:
-                    observation_ids = observation_ids[:self.config.max_obs_length]
-
+            observation_ids, evidence_mask = self._tokenize_observation_with_evidence_mask(observation)
             processed_obs_ids.append(
                 torch.tensor(observation_ids, dtype=torch.long)
             )
+            processed_evidence_masks.append(
+                torch.tensor(evidence_mask, dtype=torch.long)
+            )
 
         if not processed_obs_ids:
-            return torch.empty((0, 0), dtype=torch.long)
+            empty = torch.empty((0, 0), dtype=torch.long)
+            return empty, empty
 
-        return torch.nn.utils.rnn.pad_sequence(
+        observation_ids = torch.nn.utils.rnn.pad_sequence(
             processed_obs_ids,
             batch_first=True,
             padding_value=self.tokenizer.pad_token_id,
         )
+        evidence_masks = torch.nn.utils.rnn.pad_sequence(
+            processed_evidence_masks,
+            batch_first=True,
+            padding_value=0,
+        )
+        return observation_ids, evidence_masks
 
     def _update_rolling_state(self, rollings: DataProto, cur_responses: torch.Tensor, 
                             next_obs_ids: torch.Tensor) -> Dict:
@@ -205,51 +313,67 @@ class LLMGenerationManager:
     def _info_masked_concatenate_with_padding(self, 
                 prompt: torch.Tensor, 
                 prompt_with_mask: torch.Tensor, 
+                prompt_evidence_mask: torch.Tensor,
                 response: torch.Tensor, 
                 info: torch.Tensor = None,
+                info_evidence_mask: torch.Tensor = None,
                 pad_to_left: bool = True
             ) -> torch.Tensor:
         """Concatenate tensors and handle padding. Additionally, create a mask (info_mask) to cover the information block if it exists."""
         pad_id = self.tokenizer.pad_token_id
         tensors = [prompt, response]
         tensors_with_mask = [prompt_with_mask, response]
+        evidence_masks = [prompt_evidence_mask, torch.zeros_like(response)]
         if info is not None:
             tensors.append(info)
             info_mask = torch.full(info.size(), pad_id, dtype=info.dtype, device=info.device) # information mask
             tensors_with_mask.append(info_mask)
+            if info_evidence_mask is None:
+                raise ValueError('info_evidence_mask is required when info is provided')
+            evidence_masks.append(info_evidence_mask)
         
         concatenated = torch.cat(tensors, dim=1)
         concatenated_with_info = torch.cat(tensors_with_mask, dim=1)
+        concatenated_evidence_mask = torch.cat(evidence_masks, dim=1)
         mask = concatenated != pad_id if pad_to_left else concatenated == pad_id
         sorted_indices = mask.to(torch.int64).argsort(dim=1, stable=True)
         padded_tensor = concatenated.gather(1, sorted_indices)
         padded_tensor_with_info = concatenated_with_info.gather(1, sorted_indices)
+        padded_evidence_mask = concatenated_evidence_mask.gather(1, sorted_indices)
 
-        return padded_tensor, padded_tensor_with_info
+        return padded_tensor, padded_tensor_with_info, padded_evidence_mask
 
     def _update_right_side(self, right_side: Dict, 
                           cur_responses: torch.Tensor,
-                          next_obs_ids: torch.Tensor = None) -> Dict:
+                          next_obs_ids: torch.Tensor = None,
+                          next_obs_evidence_mask: torch.Tensor = None) -> Dict:
         """Update right side state."""
         if next_obs_ids != None:
-            responses, responses_with_info_mask = self._info_masked_concatenate_with_padding(
+            responses, responses_with_info_mask, responses_evidence_mask = self._info_masked_concatenate_with_padding(
                     right_side['responses'],
                     right_side['responses_with_info_mask'],
+                    right_side['responses_evidence_mask'],
                     cur_responses,
-                    next_obs_ids, 
+                    next_obs_ids,
+                    next_obs_evidence_mask,
                     pad_to_left=False
                 )
         else:
-            responses, responses_with_info_mask = self._info_masked_concatenate_with_padding(
+            responses, responses_with_info_mask, responses_evidence_mask = self._info_masked_concatenate_with_padding(
                     right_side['responses'],
                     right_side['responses_with_info_mask'],
+                    right_side['responses_evidence_mask'],
                     cur_responses,
                     pad_to_left=False
                 )
         effective_len = self.tensor_fn.create_attention_mask(responses).sum(dim=1).max()
         max_len = min(self.config.max_prompt_length, effective_len)
         
-        return {'responses': responses[:, :max_len], 'responses_with_info_mask': responses_with_info_mask[:, :max_len]}
+        return {
+            'responses': responses[:, :max_len],
+            'responses_with_info_mask': responses_with_info_mask[:, :max_len],
+            'responses_evidence_mask': responses_evidence_mask[:, :max_len],
+        }
 
     def _generate_with_gpu_padding(self, active_batch: DataProto) -> DataProto:
         """
@@ -306,7 +430,11 @@ class LLMGenerationManager:
         """Run main LLM generation loop."""
         
         original_left_side = {'input_ids': initial_input_ids[:, -self.config.max_start_length:]}
-        original_right_side = {'responses': initial_input_ids[:, []], 'responses_with_info_mask': initial_input_ids[:, []]}
+        original_right_side = {
+            'responses': initial_input_ids[:, []],
+            'responses_with_info_mask': initial_input_ids[:, []],
+            'responses_evidence_mask': initial_input_ids[:, []],
+        }
         
         active_mask = torch.ones(gen_batch.batch['input_ids'].shape[0], dtype=torch.bool)
         turns_stats = torch.ones(gen_batch.batch['input_ids'].shape[0], dtype=torch.int)
@@ -352,7 +480,7 @@ class LLMGenerationManager:
             valid_search_stats += torch.tensor(is_search, dtype=torch.int)
             invalid_action_stats += torch.tensor(invalid_action, dtype=torch.int)
 
-            next_obs_ids = self._process_next_obs(next_obs)
+            next_obs_ids, next_obs_evidence_mask = self._process_next_obs(next_obs)
             
             # Update states
             rollings = self._update_rolling_state(
@@ -363,7 +491,8 @@ class LLMGenerationManager:
             original_right_side = self._update_right_side(
                 original_right_side,
                 responses_ids,
-                next_obs_ids
+                next_obs_ids,
+                next_obs_evidence_mask,
             )
             
         # final LLM rollout
@@ -423,6 +552,7 @@ class LLMGenerationManager:
                             meta_info: Dict) -> Tuple[Dict, Dict]:
         """Compose final generation output."""
         final_output = right_side.copy()
+        response_evidence_mask = final_output.pop('responses_evidence_mask')
         final_output['prompts'] = left_side['input_ids']
         
         # Combine input IDs
@@ -439,6 +569,10 @@ class LLMGenerationManager:
         final_output['info_mask'] = torch.cat([
             self.tensor_fn.create_attention_mask(left_side['input_ids']),
             self.tensor_fn.create_attention_mask(final_output['responses_with_info_mask'])
+        ], dim=1)
+        final_output['evidence_mask'] = torch.cat([
+            torch.zeros_like(left_side['input_ids']),
+            response_evidence_mask,
         ], dim=1)
         
         final_output['position_ids'] = self.tensor_fn.create_position_ids(
