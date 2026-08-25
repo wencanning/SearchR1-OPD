@@ -23,13 +23,31 @@ class CharacterTokenizer:
 class ActionTokenizer:
     pad_token_id = 0
     eos_token_id = 99
+    pieces = {
+        1: '<answer>Paris</answer>',
+        2: '<search>France capital</search>ignored suffix',
+        99: '<eos>',
+    }
 
     def batch_decode(self, responses, skip_special_tokens=True):
-        del responses, skip_special_tokens
         return [
-            '<answer>Paris</answer>',
-            '<search>France capital</search>ignored suffix',
+            self.decode(row.tolist(), skip_special_tokens=skip_special_tokens)
+            for row in responses
         ]
+
+    def decode(
+        self,
+        token_ids,
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=False,
+    ):
+        del clean_up_tokenization_spaces
+        return ''.join(
+            self.pieces[token_id]
+            for token_id in token_ids
+            if token_id != self.pad_token_id
+            and not (skip_special_tokens and token_id == self.eos_token_id)
+        )
 
     def __call__(self, text, add_special_tokens=False):
         del add_special_tokens
@@ -37,26 +55,24 @@ class ActionTokenizer:
 
 
 class ExactActionTokenizer(ActionTokenizer):
-    def batch_decode(self, responses, skip_special_tokens=True):
-        del responses, skip_special_tokens
-        return [
-            '<answer>Paris</answer>',
-            '<search>France</search>discarded',
-        ]
-
-    def __call__(self, text, add_special_tokens=False):
-        del add_special_tokens
-        mapping = {
-            '</answer>': [8, 9],
-            '</search>': [6, 7],
-        }
-        return {'input_ids': mapping.get(text, [10] * len(text))}
+    pieces = {
+        21: '<answer>Paris',
+        8: '</answer',
+        9: '>',
+        31: '<search>France',
+        6: '</search',
+        7: '>',
+        55: 'discarded',
+        99: '<eos>',
+    }
 
 
 class UntaggedTokenizer(ExactActionTokenizer):
-    def batch_decode(self, responses, skip_special_tokens=True):
-        del responses, skip_special_tokens
-        return ['unfinished reasoning']
+    pieces = {
+        41: 'unfinished ',
+        42: 'reasoning',
+        99: '<eos>',
+    }
 
 
 class ObservationProcessingTest(unittest.TestCase):
@@ -126,6 +142,53 @@ class ObservationProcessingTest(unittest.TestCase):
         processed, _ = manager._postprocess_responses(torch.tensor([[41, 42, 99, 0]]))
 
         self.assertEqual(processed[0].tolist(), [41, 42, 99])
+
+    def test_noncanonical_sampled_path_is_preserved_and_counted(self):
+        class AmbiguousTokenizer:
+            pad_token_id = 0
+            eos_token_id = None
+            pieces = {
+                900: '<think>',
+                901: 'reason',
+                902: '</think>',
+                903: '<answer>',
+                904: 'done',
+                905: '</answer>',
+            }
+
+            def decode(
+                self,
+                token_ids,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            ):
+                del skip_special_tokens, clean_up_tokenization_spaces
+                return ''.join(self.pieces[token_id] for token_id in token_ids if token_id)
+
+            def batch_decode(self, batch_ids, skip_special_tokens=True):
+                return [
+                    self.decode(row.tolist(), skip_special_tokens=skip_special_tokens)
+                    for row in batch_ids
+                ]
+
+            def __call__(self, text, add_special_tokens=False):
+                del add_special_tokens
+                return {'input_ids': [ord(char) for char in text]}
+
+        manager = LLMGenerationManager.__new__(LLMGenerationManager)
+        manager.tokenizer = AmbiguousTokenizer()
+        manager.config = SimpleNamespace(no_think_rl=False)
+        sampled_ids = torch.tensor([[900, 901, 902, 903, 904, 905]])
+
+        processed, response_text = manager._postprocess_responses(sampled_ids)
+
+        torch.testing.assert_close(processed, sampled_ids)
+        self.assertEqual(
+            response_text,
+            ['<think>reason</think><answer>done</answer>'],
+        )
+        self.assertEqual(manager._sampled_response_count, 1)
+        self.assertEqual(manager._canonical_retokenization_mismatch_count, 1)
 
     def test_allows_one_invalid_action_retry(self):
         next_obs, dones, valid_action, is_search, invalid_action = self.manager.execute_predictions(

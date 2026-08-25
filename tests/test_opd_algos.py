@@ -7,6 +7,7 @@ from verl import DataProto
 from search_r1.diagnostics.opd_uncertainty import infer_evidence_step_ids, retrieval_hits_by_information_block
 from verl.trainer.ppo.core_algos import compute_opd_advantage, compute_policy_loss, compute_rce_opd_advantage
 from verl.trainer.ppo.ray_trainer import (
+    RayPPOTrainer,
     _build_rce_retrieval_hit_values,
     compute_advantage,
     compute_data_metrics,
@@ -86,6 +87,8 @@ class TestOPDAdvantage(unittest.TestCase):
             'normalize': False,
             'clip_value': None,
         }
+        batch.meta_info['sampled_token_preservation_rate'] = 1.0
+        batch.meta_info['canonical_retokenization_mismatch_rate'] = 0.25
 
         output = compute_advantage(batch, 'opd')
         metrics = compute_data_metrics(output, use_critic=False)
@@ -93,6 +96,85 @@ class TestOPDAdvantage(unittest.TestCase):
         torch.testing.assert_close(output.batch['advantages'], torch.tensor([[1.0, 0.0, 2.0]]))
         self.assertEqual(metrics['critic/advantages/mean'], 1.5)
         self.assertEqual(metrics['critic/advantages/min'], 1.0)
+        self.assertEqual(metrics['rollout/sampled_token_preservation_rate'], 1.0)
+        self.assertEqual(
+            metrics['rollout/canonical_retokenization_sequence_mismatch_rate'],
+            0.25,
+        )
+
+    def test_protocol_tags_are_excluded_only_from_opd_not_grpo(self):
+        batch = DataProto.from_dict(
+            tensors={
+                'responses': torch.ones(2, 3, dtype=torch.long),
+                'attention_mask': torch.ones(2, 5, dtype=torch.long),
+                'loss_mask': torch.ones(2, 3, dtype=torch.long),
+                'opd_distillation_mask': torch.tensor(
+                    [[0, 1, 0], [0, 1, 0]], dtype=torch.long
+                ),
+                'old_log_probs': torch.zeros(2, 3),
+                'ref_log_prob': torch.ones(2, 3),
+                'token_level_rewards': torch.tensor(
+                    [[0.0, 0.0, 1.0], [0.0, 0.0, 0.0]]
+                ),
+            },
+            non_tensors={'uid': np.array(['prompt', 'prompt'], dtype=object)},
+        )
+        batch.meta_info['opd_config'] = {
+            'advantage_mode': 'token',
+            'normalize': False,
+            'clip_value': None,
+            'distillation_coef': 1.0,
+            'grpo_reward_coef': 1.0,
+        }
+
+        output = compute_advantage(batch, 'opd')
+
+        torch.testing.assert_close(
+            output.batch['opd_advantages'],
+            torch.tensor([[0.0, 1.0, 0.0], [0.0, 1.0, 0.0]]),
+        )
+        self.assertTrue(torch.all(output.batch['weighted_opd_advantages'][:, [0, 2]] == 0))
+        self.assertTrue(torch.all(output.batch['grpo_advantages'][:, [0, 2]] != 0))
+        torch.testing.assert_close(
+            output.batch['advantages'][:, [0, 2]],
+            output.batch['grpo_advantages'][:, [0, 2]],
+        )
+
+    def test_protocol_tag_mask_tracks_split_tag_tokens(self):
+        class CharacterTokenizer:
+            def decode(
+                self,
+                token_ids,
+                skip_special_tokens=False,
+                clean_up_tokenization_spaces=False,
+            ):
+                del skip_special_tokens, clean_up_tokenization_spaces
+                return ''.join(chr(token_id) for token_id in token_ids)
+
+        text = '<think>x</think><search>q</search><answer>a</answer>'
+        response_ids = torch.tensor([[ord(char) for char in text]], dtype=torch.long)
+        batch = DataProto.from_dict(tensors={
+            'responses': response_ids,
+            'attention_mask': torch.ones(1, response_ids.shape[1] + 2, dtype=torch.long),
+            'loss_mask': torch.ones_like(response_ids),
+        })
+        trainer = RayPPOTrainer.__new__(RayPPOTrainer)
+        trainer.tokenizer = CharacterTokenizer()
+
+        output, metrics = trainer._create_opd_distillation_mask(batch, {})
+
+        kept_text = ''.join(
+            char
+            for char, keep in zip(
+                text,
+                output.batch['opd_distillation_mask'][0].tolist(),
+            )
+            if keep
+        )
+        self.assertEqual(kept_text, 'xqa')
+        self.assertTrue(torch.all(output.batch['loss_mask'] == 1))
+        self.assertEqual(metrics['opd/config/mask_protocol_tags'], 1.0)
+        self.assertGreater(metrics['opd/protocol_tag_token_fraction'], 0.0)
 
     def test_opd_divergence_matches_sod_absolute_logprob_gap(self):
         old_log_probs = torch.tensor([[-2.0, -20.0, -3.0]])

@@ -92,28 +92,121 @@ class LLMGenerationManager:
             print(f"\n[train trajectory] sample={sample_idx}")
             print(trajectory)
 
-    def _batch_tokenize(self, responses: List[str]) -> torch.Tensor:
-        """Tokenize a batch of responses."""
-        return self.tokenizer(
-            responses, 
-            add_special_tokens=False, 
-            return_tensors='pt', 
-            padding="longest"
-        )['input_ids']
+    def _postprocess_responses(
+        self,
+        responses: torch.Tensor,
+    ) -> Tuple[torch.Tensor, List[str]]:
+        """Keep the exact sampled prefix through the first complete action.
 
-    def _postprocess_responses(self, responses: torch.Tensor) -> torch.Tensor:
-        """Process responses to stop at search operation or answer operation."""
+        The rollout backend's token IDs define the on-policy action.  Action
+        boundaries are located in decoded text, but the returned training
+        sequence is always a prefix of those original IDs.  In particular,
+        decoded text is never re-tokenized to construct the rollout.
+        """
         decoded_responses = self.tokenizer.batch_decode(
             responses, 
             skip_special_tokens=True
         )
 
-        responses_str = [resp.split('</search>')[0] + '</search>'
-                 if '</search>' in resp 
-                 else resp.split('</answer>')[0] + '</answer>'
-                 if '</answer>' in resp 
-                 else resp
-                 for resp in decoded_responses]
+        processed_ids = []
+        responses_str = []
+        eos_token_id = self.tokenizer.eos_token_id
+        pad_token_id = self.tokenizer.pad_token_id
+
+        def decode_ids(token_ids, skip_special_tokens):
+            try:
+                return self.tokenizer.decode(
+                    token_ids,
+                    skip_special_tokens=skip_special_tokens,
+                    clean_up_tokenization_spaces=False,
+                )
+            except TypeError:
+                try:
+                    return self.tokenizer.decode(
+                        token_ids,
+                        skip_special_tokens=skip_special_tokens,
+                    )
+                except TypeError:
+                    return self.tokenizer.decode(token_ids)
+
+        for row_idx, decoded_response in enumerate(decoded_responses):
+            raw_ids = responses[row_idx].detach().cpu().tolist()
+            if pad_token_id != eos_token_id:
+                while raw_ids and raw_ids[-1] == pad_token_id:
+                    raw_ids.pop()
+
+            stop_candidates = [
+                (decoded_response.find(stop_tag), stop_tag)
+                for stop_tag in ('</search>', '</answer>')
+                if stop_tag in decoded_response
+            ]
+            if not stop_candidates:
+                responses_str.append(decoded_response)
+                response_ids = raw_ids
+            else:
+                stop_start, stop_tag = min(stop_candidates, key=lambda item: item[0])
+                responses_str.append(decoded_response[:stop_start + len(stop_tag)])
+
+                # Find the shortest prefix of the sampled IDs whose decode
+                # contains the complete closing tag.  This handles tokenizers
+                # that merge across textual tag boundaries without ever
+                # introducing a canonical re-tokenization into training.
+                if not raw_ids or stop_tag not in decode_ids(raw_ids, True):
+                    raise RuntimeError(
+                        'rollout batch_decode/decode disagree on the action boundary; '
+                        'refusing to replace sampled token IDs by re-tokenized text'
+                    )
+                low, high = 1, len(raw_ids)
+                while low < high:
+                    midpoint = (low + high) // 2
+                    if stop_tag in decode_ids(raw_ids[:midpoint], True):
+                        high = midpoint
+                    else:
+                        low = midpoint + 1
+                response_ids = raw_ids[:low]
+
+                # Preserve an EOS sampled directly after a final answer.  A
+                # search EOS terminates only the per-turn generation and must
+                # not be inserted into the composed multi-turn trajectory.
+                if (
+                    stop_tag == '</answer>'
+                    and low < len(raw_ids)
+                    and raw_ids[low] == eos_token_id
+                ):
+                    response_ids.append(eos_token_id)
+
+            if response_ids != raw_ids[:len(response_ids)]:
+                raise RuntimeError('postprocessed rollout is not a prefix of sampled token IDs')
+            processed_ids.append(torch.tensor(
+                response_ids,
+                dtype=responses.dtype,
+                device=responses.device,
+            ))
+
+            # Diagnostic only: measure whether decode->encode would have
+            # changed the sampled path.  These canonical IDs never enter the
+            # rollout or any log-probability computation.
+            sampled_text = decode_ids(response_ids, False)
+            canonical_ids = self.tokenizer(
+                sampled_text,
+                add_special_tokens=False,
+            )['input_ids']
+            if isinstance(canonical_ids, torch.Tensor):
+                canonical_ids = canonical_ids.detach().cpu().tolist()
+            if canonical_ids and isinstance(canonical_ids[0], list):
+                canonical_ids = canonical_ids[0]
+            self._sampled_response_count = getattr(
+                self, '_sampled_response_count', 0
+            ) + 1
+            self._canonical_retokenization_mismatch_count = getattr(
+                self, '_canonical_retokenization_mismatch_count', 0
+            ) + int(response_ids != list(canonical_ids))
+
+        responses = torch.nn.utils.rnn.pad_sequence(
+            processed_ids,
+            batch_first=True,
+            padding_value=self.tokenizer.pad_token_id,
+        )
 
         if self.config.no_think_rl:
             raise ValueError('stop')
@@ -121,72 +214,6 @@ class LLMGenerationManager:
             actions, _ = self.env.postprocess_predictions(responses_str)
             responses_str=[f"<answer>{envs[idx].ACTION_LOOKUP[action]}</answer>" for idx, action in enumerate(actions)]
             print("RESPONSES:", responses_str)
-        processed_ids = []
-        eos_token_id = self.tokenizer.eos_token_id
-        pad_token_id = self.tokenizer.pad_token_id
-        closing_tag_ids = {
-            tag: self.tokenizer(tag, add_special_tokens=False)['input_ids']
-            for tag in ('</search>', '</answer>')
-        }
-
-        def find_subsequence(sequence, subsequence):
-            if not subsequence:
-                return None
-            for start in range(len(sequence) - len(subsequence) + 1):
-                if sequence[start:start + len(subsequence)] == subsequence:
-                    return start + len(subsequence)
-            return None
-
-        for row_idx, (decoded_response, response_str) in enumerate(
-                zip(decoded_responses, responses_str)):
-            raw_ids = responses[row_idx].tolist()
-            if pad_token_id != eos_token_id:
-                while raw_ids and raw_ids[-1] == pad_token_id:
-                    raw_ids.pop()
-
-            closing_tag = (
-                '</search>' if '</search>' in response_str
-                else '</answer>' if '</answer>' in response_str
-                else None
-            )
-            closing_end = (
-                find_subsequence(raw_ids, closing_tag_ids[closing_tag])
-                if closing_tag is not None else None
-            )
-            if closing_tag is None:
-                response_ids = raw_ids
-            elif closing_end is not None:
-                # Preserve the student's exact sampled tokenization through the
-                # executed action boundary.  Only an EOS sampled immediately
-                # after a final answer is part of that executed trajectory.
-                response_ids = raw_ids[:closing_end]
-                if (
-                    closing_tag == '</answer>'
-                    and closing_end < len(raw_ids)
-                    and raw_ids[closing_end] == eos_token_id
-                ):
-                    response_ids.append(eos_token_id)
-            else:
-                # Tokenizers can theoretically merge across a tag boundary.
-                # Fall back to exact text re-tokenization, but never move an EOS
-                # across discarded decoded suffix text.
-                response_ids = self.tokenizer(
-                    response_str,
-                    add_special_tokens=False,
-                )['input_ids']
-                if (
-                    closing_tag == '</answer>'
-                    and decoded_response == response_str
-                    and eos_token_id is not None
-                    and eos_token_id in raw_ids
-                ):
-                    response_ids.append(eos_token_id)
-            processed_ids.append(torch.tensor(response_ids, dtype=torch.long))
-        responses = torch.nn.utils.rnn.pad_sequence(
-            processed_ids,
-            batch_first=True,
-            padding_value=self.tokenizer.pad_token_id,
-        )
         return responses, responses_str
 
     def _tokenize_observation_with_evidence_mask(self, observation: str) -> Tuple[List[int], List[int]]:
@@ -428,6 +455,8 @@ class LLMGenerationManager:
 
     def run_llm_loop(self, gen_batch, initial_input_ids: torch.Tensor) -> Tuple[Dict, Dict]:
         """Run main LLM generation loop."""
+        self._sampled_response_count = 0
+        self._canonical_retokenization_mismatch_count = 0
         
         original_left_side = {'input_ids': initial_input_ids[:, -self.config.max_start_length:]}
         original_right_side = {
@@ -539,6 +568,11 @@ class LLMGenerationManager:
         meta_info['valid_action_stats'] = valid_action_stats.tolist()
         meta_info['valid_search_stats'] = valid_search_stats.tolist()
         meta_info['invalid_action_stats'] = invalid_action_stats.tolist()
+        meta_info['sampled_token_preservation_rate'] = 1.0
+        meta_info['canonical_retokenization_mismatch_rate'] = (
+            float(self._canonical_retokenization_mismatch_count)
+            / max(self._sampled_response_count, 1)
+        )
         
         print("ACTIVE_TRAJ_NUM:", active_num_list)
         

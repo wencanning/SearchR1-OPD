@@ -99,6 +99,7 @@ from search_r1.diagnostics.opd_uncertainty import (
     _ground_truth_targets,
     _retrieval_hit,
     infer_evidence_step_ids,
+    infer_token_segments,
     retrieval_hits_by_information_block,
 )
 
@@ -194,8 +195,17 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
     elif adv_estimator == 'opd':
         responses = data.batch['responses']
         response_length = responses.size(-1)
-        response_mask = data.batch['loss_mask'] if 'loss_mask' in data.batch else \
+        action_mask = data.batch['loss_mask'] if 'loss_mask' in data.batch else \
             data.batch['attention_mask'][:, -response_length:]
+        distillation_mask = data.batch.get('opd_distillation_mask', action_mask)
+        if distillation_mask.shape != action_mask.shape:
+            raise ValueError(
+                'opd_distillation_mask must match the response action mask shape'
+            )
+        distillation_mask = (
+            distillation_mask.to(device=action_mask.device, dtype=action_mask.dtype)
+            * action_mask
+        )
         opd_config = data.meta_info['opd_config']
         rce_config = opd_config.get('rce', {})
         use_rce = rce_config.get('enable', False)
@@ -208,7 +218,7 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
                 old_log_prob=data.batch['old_log_probs'],
                 teacher_log_prob=data.batch['ref_log_prob'],
                 teacher_entropy=data.batch['ref_entropy'],
-                eos_mask=response_mask,
+                eos_mask=distillation_mask,
                 retrieval_hit=retrieval_hit,
                 step_ids=step_ids,
                 advantage_mode=opd_config['advantage_mode'],
@@ -227,7 +237,7 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
             opd_advantages, _ = core_algos.compute_opd_advantage(
                 old_log_prob=data.batch['old_log_probs'],
                 teacher_log_prob=data.batch['ref_log_prob'],
-                eos_mask=response_mask,
+                eos_mask=distillation_mask,
                 advantage_mode=opd_config['advantage_mode'],
                 normalize=opd_config['normalize'],
                 clip_value=opd_config['clip_value'],
@@ -240,7 +250,7 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         if grpo_reward_coef != 0:
             grpo_advantages, _ = core_algos.compute_grpo_outcome_advantage(
                 token_level_rewards=data.batch['token_level_rewards'],
-                eos_mask=response_mask,
+                eos_mask=action_mask,
                 index=data.non_tensor_batch['uid'],
             )
 
@@ -248,7 +258,7 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
             gamma = opd_config.get('gamma', 1.0)
             beta_min = opd_config.get('beta_min', 0.0)
             beta_max = opd_config.get('beta_max', 0.05)
-            task_advantages = masked_mean(grpo_advantages, response_mask, axis=1)
+            task_advantages = masked_mean(grpo_advantages, action_mask, axis=1)
             gate = torch.sigmoid(-gamma * task_advantages)
             beta = beta_min + (beta_max - beta_min) * gate
         else:
@@ -265,8 +275,9 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         returns = advantages
         data.batch['opd_advantages'] = opd_advantages
         data.batch['opd_rce_weights'] = rce_weights
-        data.batch['opd_beta'] = beta.unsqueeze(-1) * response_mask
-        data.batch['opd_effective_distillation_coef'] = effective_distillation_coef.unsqueeze(-1) * response_mask
+        data.batch['opd_beta'] = beta.unsqueeze(-1) * distillation_mask
+        data.batch['opd_effective_distillation_coef'] = \
+            effective_distillation_coef.unsqueeze(-1) * distillation_mask
         data.batch['weighted_opd_advantages'] = weighted_opd_advantages
         data.batch['grpo_advantages'] = grpo_advantages
         data.batch['advantages'] = advantages
@@ -400,6 +411,14 @@ def compute_data_metrics(batch, use_critic=True):
     if 'invalid_action_stats' in batch.meta_info:
         metrics['env/number_of_invalid_action'] = float(
             np.array(batch.meta_info['invalid_action_stats'], dtype=np.int16).mean())
+    if 'sampled_token_preservation_rate' in batch.meta_info:
+        metrics['rollout/sampled_token_preservation_rate'] = float(
+            batch.meta_info['sampled_token_preservation_rate']
+        )
+    if 'canonical_retokenization_mismatch_rate' in batch.meta_info:
+        metrics['rollout/canonical_retokenization_sequence_mismatch_rate'] = float(
+            batch.meta_info['canonical_retokenization_mismatch_rate']
+        )
 
 
     return metrics
@@ -1309,6 +1328,16 @@ class RayPPOTrainer(object):
 
                     if self.use_opd and self.config.do_search and self.config.actor_rollout_ref.actor.state_masking:
                         batch, metrics = self._create_loss_mask(batch, metrics)
+                    if self.use_opd:
+                        batch, metrics = self._create_opd_distillation_mask(
+                            batch,
+                            metrics,
+                            mask_protocol_tags=bool(
+                                self.config.algorithm.opd.get(
+                                    'mask_protocol_tags', True
+                                )
+                            ),
+                        )
 
                     if self.use_reference_policy:
                         # compute reference log_prob
@@ -1337,8 +1366,11 @@ class RayPPOTrainer(object):
                     with _timer('adv', timing_raw):
                         if self.use_opd:
                             response_length = batch.batch['responses'].size(-1)
-                            opd_mask = batch.batch['loss_mask'] if 'loss_mask' in batch.batch else \
+                            action_opd_mask = batch.batch['loss_mask'] if 'loss_mask' in batch.batch else \
                                 batch.batch['attention_mask'][:, -response_length:]
+                            opd_mask = batch.batch.get(
+                                'opd_distillation_mask', action_opd_mask
+                            )
                             opd_scores = (batch.batch['ref_log_prob'] - batch.batch['old_log_probs']) * opd_mask
                             if self.config.algorithm.opd.grpo_reward_coef != 0:
                                 reward_tensor = self.reward_fn(batch)
@@ -1443,6 +1475,24 @@ class RayPPOTrainer(object):
                             metrics['opd/effective_distillation_coef'] = masked_mean(
                                 batch.batch['opd_effective_distillation_coef'], opd_mask
                             ).item()
+                            protocol_tag_mask = batch.batch.get(
+                                'opd_protocol_tag_mask'
+                            )
+                            if (
+                                protocol_tag_mask is not None
+                                and protocol_tag_mask.sum().item() > 0
+                            ):
+                                metrics['opd/protocol_tag_logprob_gap_abs'] = masked_mean(
+                                    (
+                                        batch.batch['old_log_probs']
+                                        - batch.batch['ref_log_prob']
+                                    ).abs(),
+                                    protocol_tag_mask,
+                                ).item()
+                                metrics['opd/protocol_tag_advantage_abs'] = masked_mean(
+                                    batch.batch['weighted_opd_advantages'].abs(),
+                                    protocol_tag_mask,
+                                ).item()
                             if self.config.algorithm.opd.get('rce', {}).get('enable', False):
                                 metrics['opd/rce_weight'] = masked_mean(
                                     batch.batch['opd_rce_weights'], opd_mask
@@ -1566,4 +1616,62 @@ class RayPPOTrainer(object):
             'state_tokens/coverage': (loss_mask.sum() / response_mask.sum()).item(),
         })
         
+        return batch, metrics
+
+    def _create_opd_distillation_mask(
+        self,
+        batch: DataProto,
+        metrics: dict,
+        mask_protocol_tags: bool = True,
+    ):
+        """Build an OPD-only mask without changing the RL action mask.
+
+        Search-R1 protocol tags remain in ``loss_mask`` so GRPO can train valid
+        formatting.  They are removed only from ``opd_distillation_mask`` to
+        prevent teacher tokenization preferences from shifting student tags.
+        """
+        response_length = batch.batch['responses'].shape[-1]
+        response_mask = batch.batch['attention_mask'][:, -response_length:]
+        action_mask = batch.batch.get('loss_mask', response_mask).bool()
+        protocol_tag_mask = torch.zeros_like(action_mask, dtype=torch.bool)
+
+        for seq_idx in range(len(batch)):
+            valid_len = int(response_mask[seq_idx].sum().item())
+            response_ids = batch.batch['responses'][
+                seq_idx, :valid_len
+            ].detach().cpu().tolist()
+            token_texts = [
+                _decode_token(self.tokenizer, int(token_id))
+                for token_id in response_ids
+            ]
+            segments, _ = infer_token_segments(token_texts)
+            if segments:
+                protocol_tag_mask[seq_idx, :valid_len] = torch.tensor(
+                    [segment == 'tag' for segment in segments],
+                    dtype=torch.bool,
+                    device=protocol_tag_mask.device,
+                )
+
+        protocol_tag_mask &= action_mask
+        if mask_protocol_tags:
+            distillation_mask = action_mask & ~protocol_tag_mask
+        else:
+            distillation_mask = action_mask
+
+        batch.batch['opd_protocol_tag_mask'] = protocol_tag_mask
+        batch.batch['opd_distillation_mask'] = distillation_mask
+
+        action_tokens = float(action_mask.sum().item())
+        tag_tokens = float(protocol_tag_mask.sum().item())
+        distillation_tokens = float(distillation_mask.sum().item())
+        metrics.update({
+            'opd/protocol_tag_tokens': tag_tokens,
+            'opd/protocol_tag_token_fraction': (
+                tag_tokens / action_tokens if action_tokens > 0 else 0.0
+            ),
+            'opd/distillation_token_coverage': (
+                distillation_tokens / action_tokens if action_tokens > 0 else 0.0
+            ),
+            'opd/config/mask_protocol_tags': float(mask_protocol_tags),
+        })
         return batch, metrics
