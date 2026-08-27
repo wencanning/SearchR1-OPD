@@ -87,6 +87,74 @@ gate setting:
 combined_advantage = distillation_coef * opd_advantage
 ```
 
+## SOD baseline
+
+This repository includes a Search-R1 adaptation of
+[SOD: Step-wise On-policy Distillation for Small Language Model Agents](https://github.com/YoungZ365/SOD),
+based on upstream commit `110c4b8`. The adaptation keeps Search-R1's existing
+rollout, teacher scoring, GRPO, and actor-update paths. Only the released SOD
+step-wise weighting rule is added.
+
+Search-R1's `loss_mask` is one on assistant tokens and zero on retrieved
+observations, so each contiguous run of ones is one SOD step. For every step:
+
+```text
+d_k = mean_token |log p_student - log p_teacher|
+w_1 = 1
+w_k = min(
+    product_{u=1}^{k-1} (d_u + epsilon) / (d_{u+1} + epsilon),
+    1 + delta,
+)
+
+combined_advantage =
+    lambda_distill * w_k * opd_advantage
+    + grpo_reward_coef * grpo_outcome_advantage
+```
+
+The official defaults are `epsilon=1e-6` and `delta=0.2`. A growing
+student-teacher gap downweights later teacher supervision; when the policies
+realign, the weight can recover up to `1 + delta`. Observation and padding
+tokens have zero SOD weight. Protocol tags remain included, matching the
+upstream definition over all assistant tokens.
+
+SOD is isolated behind a default-off configuration:
+
+```yaml
+algorithm:
+  adv_estimator: opd
+  opd:
+    teacher_target: observed
+    advantage_mode: token
+    normalize: false
+    clip_value: null
+    grpo_reward_coef: 1.0
+    use_gated_distillation: false
+    rce:
+      enable: false
+    sod:
+      enable: true
+      epsilon: 1.0e-6
+      delta: 0.2
+```
+
+Run the dedicated baseline launcher with:
+
+```bash
+./train_sod.sh
+
+# Optional path or hyperparameter overrides
+STUDENT_MODEL=/path/to/student \
+TEACHER_MODEL=/path/to/teacher \
+SOD_DELTA=0.2 \
+./train_sod.sh
+```
+
+Its defaults match the 1B two-GPU `train_er_opd.sh` setup wherever the SOD
+method does not define a different variable. Existing OPD and ER-OPD launchers
+keep `algorithm.opd.sod.enable=false` through the shared default and do not
+enter this branch. Monitor `sod/stepwise_weight`, `sod/step_divergence`,
+`sod/downweighted_token_fraction`, and `sod/upweighted_token_fraction`.
+
 ## Evidence-Residual OPD
 
 Evidence-Residual OPD (ER-OPD) is an OPD teacher-target variant. It does not

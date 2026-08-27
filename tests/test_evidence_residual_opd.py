@@ -4,7 +4,10 @@ from types import SimpleNamespace
 import torch
 from omegaconf import OmegaConf
 
-from verl.trainer.ppo.ray_trainer import validate_opd_teacher_target_config
+from verl.trainer.ppo.ray_trainer import (
+    validate_opd_teacher_target_config,
+    validate_sod_config,
+)
 from verl.workers.actor.dp_actor import (
     DataParallelPPOActor,
     _trim_shared_prompt_padding,
@@ -318,6 +321,61 @@ class TeacherTargetConfigTest(unittest.TestCase):
         config.actor_rollout_ref.ref.target_forward_dtype = 'float16'
         with self.assertRaisesRegex(ValueError, 'consistently use FP16 or BF16'):
             validate_opd_teacher_target_config(config)
+
+
+class SODConfigTest(unittest.TestCase):
+    @staticmethod
+    def _config():
+        return OmegaConf.create({
+            'do_search': True,
+            'algorithm': {
+                'opd': {
+                    'teacher_target': 'observed',
+                    'advantage_mode': 'token',
+                    'normalize': False,
+                    'clip_value': None,
+                    'distillation_coef': 1.0,
+                    'lambda_distill': 1.0,
+                    'grpo_reward_coef': 1.0,
+                    'use_gated_distillation': False,
+                    'mask_protocol_tags': False,
+                    'rce': {'enable': False},
+                    'sod': {
+                        'enable': True,
+                        'epsilon': 1e-6,
+                        'delta': 0.2,
+                    },
+                },
+            },
+            'actor_rollout_ref': {
+                'actor': {
+                    'state_masking': True,
+                    'entropy_coeff': 0.0,
+                    'ppo_epochs': 1,
+                },
+            },
+        })
+
+    def test_released_sod_config_is_accepted(self):
+        validate_sod_config(self._config())
+
+    def test_sod_rejects_intervened_teacher_target(self):
+        config = self._config()
+        config.algorithm.opd.teacher_target = 'evidence_residual'
+        with self.assertRaisesRegex(ValueError, 'observed teacher target'):
+            validate_sod_config(config)
+
+    def test_sod_rejects_legacy_gate(self):
+        config = self._config()
+        config.algorithm.opd.use_gated_distillation = True
+        with self.assertRaisesRegex(ValueError, 'replaces the legacy sigmoid gate'):
+            validate_sod_config(config)
+
+    def test_sod_rejects_rce_weighting(self):
+        config = self._config()
+        config.algorithm.opd.rce.enable = True
+        with self.assertRaisesRegex(ValueError, 'SOD and RCE'):
+            validate_sod_config(config)
 
 
 class _FakeTokenizer:

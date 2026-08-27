@@ -32,8 +32,9 @@ Built upon [veRL](https://github.com/volcengine/verl), Search-R1 extends the ide
 
 <!-- Through RL (rule-based outcome reward), the 3B **base** LLM (both Qwen2.5-3b-base and Llama3.2-3b-base) develops reasoning and search engine calling abilities all on its own. -->
 
-We support different training methods (e.g., PPO, GRPO, reinforce, and
-[On-Policy Distillation](docs/opd.md)), different LLMs (e.g., llama3,
+We support different training methods (e.g., PPO, GRPO, reinforce,
+[On-Policy Distillation](docs/opd.md), and the
+[SOD baseline](docs/opd.md#sod-baseline)), different LLMs (e.g., llama3,
 Qwen2.5, etc) and different search engines (e.g., local sparse/dense retrievers
 and online search engines).
 

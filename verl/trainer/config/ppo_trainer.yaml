@@ -219,6 +219,12 @@ algorithm:
       tau: 0.0
       default_retrieval_hit: 0.5
       eps: 1.0e-8
+    # SOD: step-wise OPD weighting from YoungZ365/SOD. The dedicated launcher
+    # opts in; keeping this false preserves every existing OPD/ER-OPD path.
+    sod:
+      enable: false
+      epsilon: 1.0e-6
+      delta: 0.2
     diagnostics:
       enable: false
       output_dir: null

@@ -5,7 +5,12 @@ import torch
 
 from verl import DataProto
 from search_r1.diagnostics.opd_uncertainty import infer_evidence_step_ids, retrieval_hits_by_information_block
-from verl.trainer.ppo.core_algos import compute_opd_advantage, compute_policy_loss, compute_rce_opd_advantage
+from verl.trainer.ppo.core_algos import (
+    compute_opd_advantage,
+    compute_policy_loss,
+    compute_rce_opd_advantage,
+    compute_sod_stepwise_weights,
+)
 from verl.trainer.ppo.ray_trainer import (
     RayPPOTrainer,
     _build_rce_retrieval_hit_values,
@@ -94,6 +99,8 @@ class TestOPDAdvantage(unittest.TestCase):
         metrics = compute_data_metrics(output, use_critic=False)
 
         torch.testing.assert_close(output.batch['advantages'], torch.tensor([[1.0, 0.0, 2.0]]))
+        self.assertNotIn('opd_sod_stepwise_weights', output.batch)
+        self.assertNotIn('opd_sod_step_divergence', output.batch)
         self.assertEqual(metrics['critic/advantages/mean'], 1.5)
         self.assertEqual(metrics['critic/advantages/min'], 1.0)
         self.assertEqual(metrics['rollout/sampled_token_preservation_rate'], 1.0)
@@ -192,6 +199,91 @@ class TestOPDAdvantage(unittest.TestCase):
         self.assertEqual(metrics['opd/divergence'], 1.5)
         self.assertEqual(metrics['opd/reverse_kl_k1'], -1.5)
         self.assertEqual(metrics['opd/teacher_advantage'], 1.5)
+
+    def test_sod_weights_contiguous_assistant_steps(self):
+        student = torch.zeros(1, 8)
+        teacher = torch.tensor([[1.0, 1.0, 99.0, 99.0, 2.0, 2.0, 99.0, 0.5]])
+        action_mask = torch.tensor([[1, 1, 0, 0, 1, 1, 0, 1]])
+
+        weights, divergence = compute_sod_stepwise_weights(
+            student,
+            teacher,
+            action_mask,
+            epsilon=1e-6,
+            delta=0.2,
+        )
+
+        second_weight = (1.0 + 1e-6) / (2.0 + 1e-6)
+        expected_weights = torch.tensor([[
+            1.0, 1.0, 0.0, 0.0,
+            second_weight, second_weight, 0.0, 1.2,
+        ]])
+        expected_divergence = torch.tensor([[
+            1.0, 1.0, 0.0, 0.0, 2.0, 2.0, 0.0, 0.5,
+        ]])
+
+        torch.testing.assert_close(weights, expected_weights)
+        torch.testing.assert_close(divergence, expected_divergence)
+
+    def test_sod_combines_stepwise_opd_with_grpo(self):
+        action_mask = torch.tensor([
+            [1, 1, 0, 1, 1, 0],
+            [1, 1, 0, 1, 1, 0],
+        ], dtype=torch.long)
+        teacher_log_prob = torch.tensor([
+            [1.0, 1.0, 50.0, 2.0, 2.0, 50.0],
+            [1.0, 1.0, 50.0, 2.0, 2.0, 50.0],
+        ])
+        batch = DataProto.from_dict(
+            tensors={
+                'responses': torch.ones(2, 6, dtype=torch.long),
+                'attention_mask': torch.ones(2, 8, dtype=torch.long),
+                'loss_mask': action_mask,
+                'old_log_probs': torch.zeros(2, 6),
+                'ref_log_prob': teacher_log_prob,
+                'token_level_rewards': torch.tensor([
+                    [0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+                    [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                ]),
+            },
+            non_tensors={'uid': np.array(['prompt', 'prompt'], dtype=object)},
+        )
+        batch.meta_info['opd_config'] = {
+            'advantage_mode': 'token',
+            'normalize': False,
+            'clip_value': None,
+            'distillation_coef': 1.0,
+            'grpo_reward_coef': 1.0,
+            'use_gated_distillation': False,
+            'sod': {
+                'enable': True,
+                'epsilon': 1e-6,
+                'delta': 0.2,
+            },
+        }
+
+        output = compute_advantage(batch, 'opd')
+
+        second_weight = (1.0 + 1e-6) / (2.0 + 1e-6)
+        expected_weights = torch.tensor([
+            [1.0, 1.0, 0.0, second_weight, second_weight, 0.0],
+            [1.0, 1.0, 0.0, second_weight, second_weight, 0.0],
+        ])
+        expected_weighted_opd = action_mask.float()
+
+        torch.testing.assert_close(
+            output.batch['opd_sod_stepwise_weights'], expected_weights
+        )
+        torch.testing.assert_close(
+            output.batch['opd_effective_distillation_coef'], expected_weights
+        )
+        torch.testing.assert_close(
+            output.batch['weighted_opd_advantages'], expected_weighted_opd
+        )
+        torch.testing.assert_close(
+            output.batch['advantages'],
+            output.batch['grpo_advantages'] + expected_weighted_opd,
+        )
 
     def test_opd_can_add_grpo_outcome_advantage(self):
         batch = DataProto.from_dict(

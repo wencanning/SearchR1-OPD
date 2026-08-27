@@ -208,7 +208,11 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         )
         opd_config = data.meta_info['opd_config']
         rce_config = opd_config.get('rce', {})
+        sod_config = opd_config.get('sod', {})
         use_rce = rce_config.get('enable', False)
+        use_sod = sod_config.get('enable', False)
+        if use_rce and use_sod:
+            raise ValueError('SOD step-wise weighting and RCE weighting are mutually exclusive')
         if use_rce:
             if 'ref_entropy' not in data.batch:
                 raise ValueError('RCE-OPD requires ref_entropy from the teacher/reference policy')
@@ -243,10 +247,31 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
                 clip_value=opd_config['clip_value'],
             )
             rce_weights = torch.zeros_like(opd_advantages)
+
+        if use_sod:
+            if opd_config['advantage_mode'] != 'token':
+                raise ValueError('SOD requires token-mode OPD advantages')
+            if opd_config['normalize'] or opd_config['clip_value'] is not None:
+                raise ValueError('SOD requires unnormalized, unclipped OPD advantages')
+            sod_stepwise_weights, sod_step_divergence = \
+                core_algos.compute_sod_stepwise_weights(
+                    old_log_prob=data.batch['old_log_probs'],
+                    teacher_log_prob=data.batch['ref_log_prob'],
+                    step_mask=action_mask,
+                    epsilon=float(sod_config.get('epsilon', 1e-6)),
+                    delta=float(sod_config.get('delta', 0.2)),
+                )
+            sod_stepwise_weights = sod_stepwise_weights.to(opd_advantages.device)
+            sod_step_divergence = sod_step_divergence.to(opd_advantages.device)
+
         grpo_advantages = torch.zeros_like(opd_advantages)
         grpo_reward_coef = opd_config.get('grpo_reward_coef', 0.0)
         distillation_coef = opd_config.get('distillation_coef', 1.0)
-        use_gated_distillation = opd_config.get('use_gated_distillation', False) and grpo_reward_coef != 0
+        use_gated_distillation = (
+            opd_config.get('use_gated_distillation', False)
+            and grpo_reward_coef != 0
+            and not use_sod
+        )
         if grpo_reward_coef != 0:
             grpo_advantages, _ = core_algos.compute_grpo_outcome_advantage(
                 token_level_rewards=data.batch['token_level_rewards'],
@@ -268,16 +293,29 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
                 dtype=opd_advantages.dtype,
                 device=opd_advantages.device,
             )
-        effective_distillation_coef = distillation_coef * beta
-        weighted_opd_advantages = effective_distillation_coef.unsqueeze(-1) * opd_advantages
+        if use_sod:
+            effective_distillation_coef = (
+                distillation_coef * sod_stepwise_weights * distillation_mask
+            )
+            weighted_opd_advantages = effective_distillation_coef * opd_advantages
+        else:
+            effective_distillation_coef = distillation_coef * beta
+            weighted_opd_advantages = (
+                effective_distillation_coef.unsqueeze(-1) * opd_advantages
+            )
 
         advantages = weighted_opd_advantages + grpo_reward_coef * grpo_advantages
         returns = advantages
         data.batch['opd_advantages'] = opd_advantages
         data.batch['opd_rce_weights'] = rce_weights
         data.batch['opd_beta'] = beta.unsqueeze(-1) * distillation_mask
-        data.batch['opd_effective_distillation_coef'] = \
-            effective_distillation_coef.unsqueeze(-1) * distillation_mask
+        if use_sod:
+            data.batch['opd_effective_distillation_coef'] = effective_distillation_coef
+            data.batch['opd_sod_stepwise_weights'] = sod_stepwise_weights
+            data.batch['opd_sod_step_divergence'] = sod_step_divergence
+        else:
+            data.batch['opd_effective_distillation_coef'] = \
+                effective_distillation_coef.unsqueeze(-1) * distillation_mask
         data.batch['weighted_opd_advantages'] = weighted_opd_advantages
         data.batch['grpo_advantages'] = grpo_advantages
         data.batch['advantages'] = advantages
@@ -556,6 +594,51 @@ def validate_opd_teacher_target_config(config):
             raise ValueError('entropy_matched requires a positive pre-calibrated entropy_matched_tau')
 
 
+def validate_sod_config(config):
+    """Reject configurations that no longer represent the released SOD baseline."""
+    opd_config = config.algorithm.opd
+    sod_config = opd_config.get('sod', {})
+    if not sod_config.get('enable', False):
+        return
+
+    if opd_config.get('teacher_target', 'observed') != 'observed':
+        raise ValueError('SOD requires the ordinary observed teacher target')
+    if not config.do_search:
+        raise ValueError('SOD requires multi-step search-agent trajectories')
+    if not config.actor_rollout_ref.actor.state_masking:
+        raise ValueError('SOD requires state_masking=true so observations delimit assistant steps')
+    if opd_config.advantage_mode != 'token':
+        raise ValueError('SOD requires advantage_mode=token')
+    if opd_config.normalize:
+        raise ValueError('SOD requires normalize=false')
+    if opd_config.clip_value is not None:
+        raise ValueError('SOD requires clip_value=null')
+    if float(opd_config.get('grpo_reward_coef', 0.0)) <= 0:
+        raise ValueError('the released SOD baseline requires a positive GRPO reward coefficient')
+    if opd_config.get('use_gated_distillation', False):
+        raise ValueError('SOD step-wise weighting replaces the legacy sigmoid gate')
+    if opd_config.get('rce', {}).get('enable', False):
+        raise ValueError('SOD and RCE weighting cannot be enabled together')
+    if opd_config.get('mask_protocol_tags', False):
+        raise ValueError('SOD requires all assistant tokens when measuring step divergence')
+    if config.actor_rollout_ref.actor.entropy_coeff != 0:
+        raise ValueError('SOD requires actor entropy_coeff=0')
+    if config.actor_rollout_ref.actor.ppo_epochs != 1:
+        raise ValueError('SOD requires one PPO epoch per rollout batch')
+
+    epsilon = float(sod_config.get('epsilon', 1e-6))
+    delta = float(sod_config.get('delta', 0.2))
+    if epsilon <= 0:
+        raise ValueError('SOD epsilon must be positive')
+    if delta < 0:
+        raise ValueError('SOD delta must be non-negative')
+    lambda_distill = opd_config.get('lambda_distill')
+    if lambda_distill is None:
+        lambda_distill = opd_config.get('distillation_coef', 1.0)
+    if float(lambda_distill) <= 0:
+        raise ValueError('SOD requires a positive distillation coefficient')
+
+
 class RayPPOTrainer(object):
     """
     Note that this trainer runs on the driver process on a single CPU/GPU node.
@@ -600,6 +683,7 @@ class RayPPOTrainer(object):
             assert not config.do_search or config.actor_rollout_ref.actor.state_masking, \
                 'Search OPD requires actor.state_masking=true to exclude observation tokens'
             validate_opd_teacher_target_config(config)
+            validate_sod_config(config)
             if config.algorithm.opd.grpo_reward_coef != 0:
                 group_size = config.actor_rollout_ref.rollout.n_agent * config.actor_rollout_ref.rollout.n
                 assert group_size > 1, 'OPD + GRPO reward requires more than one rollout per prompt'
@@ -1398,6 +1482,7 @@ class RayPPOTrainer(object):
                                 'beta_min': self.config.algorithm.opd.get('beta_min', 0.0),
                                 'beta_max': self.config.algorithm.opd.get('beta_max', 0.05),
                                 'rce': self._plain_config(self.config.algorithm.opd.get('rce', {})),
+                                'sod': self._plain_config(self.config.algorithm.opd.get('sod', {})),
                             }
                             metrics.update(
                                 compute_opd_logprob_metrics(
@@ -1475,6 +1560,23 @@ class RayPPOTrainer(object):
                             metrics['opd/effective_distillation_coef'] = masked_mean(
                                 batch.batch['opd_effective_distillation_coef'], opd_mask
                             ).item()
+                            if self.config.algorithm.opd.get('sod', {}).get('enable', False):
+                                sod_weights = batch.batch['opd_sod_stepwise_weights']
+                                metrics['sod/stepwise_weight'] = masked_mean(
+                                    sod_weights, action_opd_mask
+                                ).item()
+                                metrics['sod/step_divergence'] = masked_mean(
+                                    batch.batch['opd_sod_step_divergence'],
+                                    action_opd_mask,
+                                ).item()
+                                metrics['sod/downweighted_token_fraction'] = masked_mean(
+                                    (sod_weights < 1.0).float(),
+                                    action_opd_mask,
+                                ).item()
+                                metrics['sod/upweighted_token_fraction'] = masked_mean(
+                                    (sod_weights > 1.0).float(),
+                                    action_opd_mask,
+                                ).item()
                             protocol_tag_mask = batch.batch.get(
                                 'opd_protocol_tag_mask'
                             )

@@ -190,6 +190,93 @@ def compute_opd_advantage(old_log_prob: torch.Tensor,
     return advantages, advantages
 
 
+def compute_sod_stepwise_weights(old_log_prob: torch.Tensor,
+                                 teacher_log_prob: torch.Tensor,
+                                 step_mask: torch.Tensor,
+                                 epsilon: float = 1e-6,
+                                 delta: float = 0.2):
+    """Compute the SOD weight for every policy token.
+
+    This is adapted from ``YoungZ365/SOD`` commit ``110c4b8`` for the
+    Search-R1 rollout representation.  A step is one contiguous run in
+    ``step_mask``; Search-R1's observation tokens are zero in that mask and
+    therefore separate consecutive assistant turns.
+
+    For step ``k``, ``d_k`` is the mean absolute sampled-token log-probability
+    gap between the student and teacher.  The first step has weight one and
+    later steps use the cumulative adjacent-divergence ratio from SOD:
+
+    ``w_k = min(prod_{u < k} (d_u + epsilon) / (d_{u+1} + epsilon), 1 + delta)``.
+
+    Returns the token-broadcast step weights and divergences.  Both tensors are
+    zero outside policy steps.
+    """
+    if old_log_prob.shape != teacher_log_prob.shape:
+        raise ValueError('student and teacher log probabilities must have the same shape')
+    if step_mask.shape != old_log_prob.shape:
+        raise ValueError('step_mask must have the same shape as log probabilities')
+    if old_log_prob.dim() != 2:
+        raise ValueError('SOD expects rank-2 (batch, response_length) tensors')
+    if epsilon <= 0:
+        raise ValueError(f'SOD epsilon must be positive, got {epsilon}')
+    if delta < 0:
+        raise ValueError(f'SOD delta must be non-negative, got {delta}')
+
+    with torch.no_grad():
+        policy_mask = step_mask.bool()
+        abs_logprob_gap = (old_log_prob - teacher_log_prob).abs().float()
+        stepwise_weights = torch.zeros_like(abs_logprob_gap, dtype=torch.float32)
+        stepwise_divergence = torch.zeros_like(abs_logprob_gap, dtype=torch.float32)
+        upper_bound = 1.0 + float(delta)
+
+        for batch_idx in range(policy_mask.shape[0]):
+            active_indices = torch.nonzero(
+                policy_mask[batch_idx], as_tuple=False
+            ).squeeze(-1)
+            if active_indices.numel() == 0:
+                continue
+
+            split_locations = torch.nonzero(
+                active_indices[1:] != active_indices[:-1] + 1,
+                as_tuple=False,
+            ).squeeze(-1)
+            segment_starts = torch.cat((
+                active_indices.new_tensor([0]),
+                split_locations + 1,
+            ))
+            segment_ends = torch.cat((
+                split_locations + 1,
+                active_indices.new_tensor([active_indices.numel()]),
+            ))
+
+            divergences = []
+            boundaries = []
+            for start_offset, end_offset in zip(segment_starts, segment_ends):
+                segment_indices = active_indices[start_offset:end_offset]
+                start = int(segment_indices[0].item())
+                end = int(segment_indices[-1].item()) + 1
+                divergence = abs_logprob_gap[batch_idx, start:end].mean()
+                divergences.append(divergence)
+                boundaries.append((start, end))
+
+            weights = [abs_logprob_gap.new_tensor(1.0)]
+            cumulative_ratio = abs_logprob_gap.new_tensor(1.0)
+            for step_idx in range(len(divergences) - 1):
+                cumulative_ratio = cumulative_ratio * (
+                    (divergences[step_idx] + epsilon)
+                    / (divergences[step_idx + 1] + epsilon)
+                )
+                weights.append(torch.clamp(cumulative_ratio, max=upper_bound))
+
+            for (start, end), divergence, weight in zip(
+                boundaries, divergences, weights
+            ):
+                stepwise_weights[batch_idx, start:end] = weight
+                stepwise_divergence[batch_idx, start:end] = divergence
+
+    return stepwise_weights, stepwise_divergence
+
+
 def _normalize_vector(values: torch.Tensor,
                       method: str = 'percentile_rank',
                       eps: float = 1e-8):
