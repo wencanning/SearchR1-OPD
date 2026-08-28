@@ -5,16 +5,16 @@ set -euo pipefail
 #   https://github.com/omron-sinicx/dgpo (commit 33df0d0)
 #
 # This comparison substitutes our own 0.5B student and 7B Search-R1 teacher for
-# the authors' released checkpoints. Per the requested fair-comparison setting,
-# the online optimizer is GRPO rather than the official PPO/GAE: correct
-# trajectory -> EM reward only; incorrect trajectory -> selective teacher KL,
-# followed by group-relative advantage normalization.
+# the authors' released checkpoints. The online objective follows the official
+# PPO/GAE implementation: correct trajectory -> EM reward only; incorrect
+# trajectory -> selective forward-KL guidance from the teacher.
 #
-# All non-method training settings match our formal 0.5B ER-OPD run e4fmtict:
-# data split, batch and rollout multiplicity, lengths, learning rate, clipping,
-# memory settings, 200 optimizer updates, validation cadence, and two-A100
-# placement. Values are fixed so stale parent-shell exports cannot alter the
-# run; explicit Hydra overrides in "$@" remain available.
+# Data, sequence lengths, learning rate, 200 rollout/update cycles, validation
+# cadence, and two-A100 placement retain the formal 0.5B ER-OPD comparison
+# setting e4fmtict. PPO-specific settings (GAE, one rollout per prompt, critic,
+# warmup, entropy, and symmetric clipping) follow the official DGPO launcher.
+# Values are fixed so stale parent-shell exports cannot alter the run; explicit
+# Hydra overrides in "$@" remain available.
 
 export NO_PROXY="127.0.0.1,localhost"
 export no_proxy="127.0.0.1,localhost"
@@ -27,7 +27,7 @@ TRAIN_DATA_SOURCE="hotpotqa"
 VAL_DATA_SOURCE="null"
 STUDENT_MODEL="data/student/0.5B"
 TEACHER_MODEL="/data/home/wencanning/models/SearchR1-nq_hotpotqa_train-qwen2.5-7b-it-em-grpo-v0.3"
-EXPERIMENT_NAME="dgpo-grpo-0.5B-200steps"
+EXPERIMENT_NAME="dgpo-ppo-0.5B-200steps"
 WAND_PROJECT="Search-R1-OPD2"
 N_GPUS="2"
 # The legacy trainer starts at step 1 and stops after incrementing the counter;
@@ -37,11 +37,12 @@ TRAIN_BATCH_SIZE="128"
 VAL_BATCH_SIZE="512"
 PPO_MINI_BATCH_SIZE="128"
 ACTOR_PPO_MICRO_BATCH_SIZE="8"
+CRITIC_PPO_MICRO_BATCH_SIZE="8"
 ROLLOUT_LOG_PROB_MICRO_BATCH_SIZE="32"
 REF_LOG_PROB_MICRO_BATCH_SIZE="16"
 DGPO_REWARD_THRESHOLD="0.1"
 DGPO_KL_COEF="0.001"
-DGPO_N_AGENT="8"
+DGPO_N_AGENT="1"
 DGPO_ROLLOUT_SEED="null"
 
 PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
@@ -56,7 +57,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     data.max_start_length=2048 \
     data.max_obs_length=512 \
     data.shuffle_train_dataloader=true \
-    algorithm.adv_estimator=grpo \
+    algorithm.adv_estimator=gae \
     algorithm.dgpo.enable=true \
     algorithm.dgpo.reward_threshold="$DGPO_REWARD_THRESHOLD" \
     algorithm.kl_penalty=kl \
@@ -76,15 +77,15 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.enable_gradient_checkpointing=true \
     actor_rollout_ref.model.use_remove_padding=true \
     actor_rollout_ref.actor.optim.lr=1e-6 \
-    actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.0 \
+    actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.285 \
     actor_rollout_ref.actor.ppo_mini_batch_size="$PPO_MINI_BATCH_SIZE" \
     actor_rollout_ref.actor.ppo_micro_batch_size="$ACTOR_PPO_MICRO_BATCH_SIZE" \
     actor_rollout_ref.actor.ppo_epochs=1 \
     actor_rollout_ref.actor.clip_ratio=0.2 \
     actor_rollout_ref.actor.clip_ratio_low=0.2 \
-    actor_rollout_ref.actor.clip_ratio_high=0.28 \
+    actor_rollout_ref.actor.clip_ratio_high=0.2 \
     actor_rollout_ref.actor.clip_ratio_c=3.0 \
-    actor_rollout_ref.actor.entropy_coeff=0.0 \
+    actor_rollout_ref.actor.entropy_coeff=0.001 \
     actor_rollout_ref.actor.state_masking=true \
     actor_rollout_ref.actor.use_kl_loss=false \
     actor_rollout_ref.actor.kl_loss_type=kl \
@@ -103,6 +104,16 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.log_prob_micro_batch_size="$REF_LOG_PROB_MICRO_BATCH_SIZE" \
     actor_rollout_ref.ref.log_prob_use_dynamic_bsz=false \
     actor_rollout_ref.ref.fsdp_config.param_offload=false \
+    critic.model.path="$STUDENT_MODEL" \
+    critic.model.enable_gradient_checkpointing=true \
+    critic.model.use_remove_padding=true \
+    critic.optim.lr=1e-5 \
+    critic.optim.lr_warmup_steps_ratio=0.015 \
+    critic.ppo_mini_batch_size="$PPO_MINI_BATCH_SIZE" \
+    critic.ppo_micro_batch_size="$CRITIC_PPO_MICRO_BATCH_SIZE" \
+    critic.model.fsdp_config.param_offload=false \
+    critic.model.fsdp_config.grad_offload=false \
+    critic.model.fsdp_config.optimizer_offload=false \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
     +trainer.val_before_train=false \
