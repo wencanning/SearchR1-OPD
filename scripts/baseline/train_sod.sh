@@ -1,36 +1,39 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Search-R1 baseline adaptation of YoungZ365/SOD commit 110c4b8.  Defaults
-# intentionally match train_er_opd.sh's 1B two-GPU run wherever SOD does not
-# define the experimental variable.
+# Search-R1 baseline adaptation of YoungZ365/SOD commit 110c4b8. Defaults
+# intentionally match the 0.5B ER-OPD run e4fmtict wherever SOD does not define
+# the experimental variable.
+# Formal-run values are fixed below so stale parent-shell exports cannot change
+# the baseline. Explicit Hydra overrides in "$@" remain available.
 
-export NO_PROXY="${NO_PROXY:+${NO_PROXY},}127.0.0.1,localhost"
-export no_proxy="${no_proxy:+${no_proxy},}127.0.0.1,localhost"
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2,3}"
-export VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-XFORMERS}"
+export NO_PROXY="127.0.0.1,localhost"
+export no_proxy="127.0.0.1,localhost"
+export CUDA_VISIBLE_DEVICES="2,3"
+export VLLM_ATTENTION_BACKEND="XFORMERS"
 
-DATA_DIR="${DATA_DIR:-data/nq_hotpotqa_train_30k_no_cold_start}"
-VAL_FILE="${VAL_FILE:-$DATA_DIR/validation_diagnostic_512.parquet}"
-TRAIN_DATA_SOURCE="${TRAIN_DATA_SOURCE:-hotpotqa}"
-VAL_DATA_SOURCE="${VAL_DATA_SOURCE:-null}"
-STUDENT_MODEL="${STUDENT_MODEL:-data/student/1B}"
-TEACHER_MODEL="${TEACHER_MODEL:-/data/home/wencanning/models/SearchR1-nq_hotpotqa_train-qwen2.5-7b-it-em-grpo-v0.3}"
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-sod-grpo-1B}"
-WAND_PROJECT="${WAND_PROJECT:-Search-R1-OPD2}"
-N_GPUS="${N_GPUS:-$(awk -F, '{print NF}' <<< "$CUDA_VISIBLE_DEVICES")}"
-TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-201}"
-TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-128}"
-VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-256}"
-SOD_PPO_MINI_BATCH_SIZE="${SOD_PPO_MINI_BATCH_SIZE:-128}"
-SOD_PPO_MICRO_BATCH_SIZE="${SOD_PPO_MICRO_BATCH_SIZE:-8}"
-SOD_ROLLOUT_LOG_PROB_MICRO_BATCH_SIZE="${SOD_ROLLOUT_LOG_PROB_MICRO_BATCH_SIZE:-32}"
-SOD_REF_LOG_PROB_MICRO_BATCH_SIZE="${SOD_REF_LOG_PROB_MICRO_BATCH_SIZE:-8}"
-SOD_LAMBDA_DISTILL="${SOD_LAMBDA_DISTILL:-1.0}"
-SOD_GRPO_REWARD_COEF="${SOD_GRPO_REWARD_COEF:-1.0}"
-SOD_N_AGENT="${SOD_N_AGENT:-8}"
-SOD_EPSILON="${SOD_EPSILON:-1e-6}"
-SOD_DELTA="${SOD_DELTA:-0.2}"
+DATA_DIR="data/nq_hotpotqa_train_30k_no_cold_start"
+VAL_FILE="$DATA_DIR/validation_diagnostic_512.parquet"
+TRAIN_DATA_SOURCE="hotpotqa"
+VAL_DATA_SOURCE="null"
+STUDENT_MODEL="data/student/0.5B"
+TEACHER_MODEL="/data/home/wencanning/models/SearchR1-nq_hotpotqa_train-qwen2.5-7b-it-em-grpo-v0.3"
+EXPERIMENT_NAME="sod-grpo-0.5B"
+WAND_PROJECT="Search-R1-OPD2"
+N_GPUS="2"
+TOTAL_TRAINING_STEPS="201"
+TRAIN_BATCH_SIZE="128"
+VAL_BATCH_SIZE="512"
+SOD_PPO_MINI_BATCH_SIZE="128"
+SOD_PPO_MICRO_BATCH_SIZE="8"
+SOD_ROLLOUT_LOG_PROB_MICRO_BATCH_SIZE="32"
+SOD_REF_LOG_PROB_MICRO_BATCH_SIZE="16"
+SOD_LAMBDA_DISTILL="1.0"
+SOD_GRPO_REWARD_COEF="1.0"
+SOD_N_AGENT="8"
+SOD_EPSILON="1e-6"
+SOD_DELTA="0.2"
+SOD_TARGET_TOKEN_CHUNK_SIZE="512"
 
 PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     data.train_files="$DATA_DIR/train.parquet" \
@@ -51,6 +54,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     algorithm.opd.mask_protocol_tags=false \
     algorithm.opd.lambda_distill="$SOD_LAMBDA_DISTILL" \
     algorithm.opd.teacher_target=observed \
+    algorithm.opd.target_token_chunk_size="$SOD_TARGET_TOKEN_CHUNK_SIZE" \
     algorithm.opd.grpo_reward_coef="$SOD_GRPO_REWARD_COEF" \
     algorithm.opd.use_gated_distillation=false \
     algorithm.opd.rce.enable=false \
@@ -64,6 +68,9 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.attn_implementation=sdpa \
     actor_rollout_ref.ref.target_forward_dtype=float16 \
     actor_rollout_ref.ref.allow_approximate_target_precision=true \
+    actor_rollout_ref.ref.target_select_policy_logits=true \
+    actor_rollout_ref.ref.target_trim_shared_prompt_padding=true \
+    actor_rollout_ref.ref.allow_tf32=false \
     actor_rollout_ref.ref.fsdp_config.model_dtype=float16 \
     actor_rollout_ref.ref.fsdp_config.mixed_precision.param_dtype=float16 \
     actor_rollout_ref.model.enable_gradient_checkpointing=true \
