@@ -186,6 +186,13 @@ algorithm:
   gamma: 1.0
   lam: 1.0
   adv_estimator: gae
+  # Distillation-Guided Policy Optimization (omron-sinicx/dgpo). The baseline
+  # launcher opts in and supplies a KD-initialized student plus a teacher model.
+  # When enabled, KL guidance is applied only to trajectories whose token-level
+  # task rewards are all below reward_threshold, matching the official code.
+  dgpo:
+    enable: false
+    reward_threshold: 0.1
   opd:
     # token: distill each sampled token; sequence: use future cumulative K1 signal
     advantage_mode: token

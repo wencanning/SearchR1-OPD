@@ -131,7 +131,39 @@ def _build_rce_retrieval_hit_values(evidence_step_ids, block_hits, pre_retrieval
     return values
 
 
-def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty='kl'):
+def create_dgpo_reward_mask(token_level_scores: torch.Tensor,
+                            response_length: int,
+                            reward_threshold: float = 0.1) -> torch.Tensor:
+    """Return the official DGPO mask: guide only trajectories below the reward threshold."""
+    if token_level_scores.ndim != 2:
+        raise ValueError('DGPO token_level_scores must have shape [batch, response_length]')
+    if token_level_scores.size(1) != response_length:
+        raise ValueError('DGPO reward mask must match the response length')
+
+    incorrect = (token_level_scores < reward_threshold).all(dim=1)
+    return incorrect.unsqueeze(1).expand(-1, response_length).to(token_level_scores.dtype)
+
+
+def _safe_masked_mean(x: torch.Tensor,
+                      mask: torch.Tensor,
+                      axis: int = -1,
+                      eps: float = 1e-8) -> torch.Tensor:
+    """Masked mean that maps an empty (correct-sample) DGPO mask to zero."""
+    mask = mask.to(dtype=x.dtype)
+    denominator = mask.sum(dim=axis)
+    numerator = (x * mask).sum(dim=axis)
+    return torch.where(
+        denominator > 0,
+        numerator / (denominator + eps),
+        torch.zeros_like(numerator),
+    )
+
+
+def apply_kl_penalty(data: DataProto,
+                     kl_ctrl: core_algos.AdaptiveKLController,
+                     kl_penalty='kl',
+                     dgpo_selective_kl: bool = False,
+                     dgpo_reward_threshold: float = 0.1):
     responses = data.batch['responses']
     response_length = responses.size(1)
     token_level_scores = data.batch['token_level_scores']
@@ -139,11 +171,22 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
     attention_mask = data.batch['info_mask'] if 'info_mask' in data.batch else data.batch['attention_mask']
     response_mask = attention_mask[:, -response_length:]
 
+    kl_mask = response_mask
+    dgpo_metrics = {}
+    if dgpo_selective_kl:
+        reward_mask = create_dgpo_reward_mask(
+            token_level_scores=token_level_scores,
+            response_length=response_length,
+            reward_threshold=dgpo_reward_threshold,
+        )
+        kl_mask = response_mask * reward_mask
+        dgpo_metrics['dgpo/incorrect_trajectory_fraction'] = reward_mask[:, 0].float().mean().item()
+
     # compute kl between ref_policy and current policy
     if 'ref_log_prob' in data.batch.keys():
         kld = core_algos.kl_penalty(data.batch['old_log_probs'], data.batch['ref_log_prob'],
                                     kl_penalty=kl_penalty)  # (batch_size, response_length)
-        kld = kld * response_mask
+        kld = kld * kl_mask
         beta = kl_ctrl.value
     else:
         beta = 0
@@ -151,7 +194,10 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
 
     token_level_rewards = token_level_scores - beta * kld
 
-    current_kl = masked_mean(kld, mask=response_mask, axis=-1)  # average over sequence
+    if dgpo_selective_kl:
+        current_kl = _safe_masked_mean(kld, mask=kl_mask, axis=-1)
+    else:
+        current_kl = masked_mean(kld, mask=response_mask, axis=-1)  # average over sequence
     current_kl = torch.mean(current_kl, dim=0).item()
 
     # according to https://github.com/huggingface/trl/blob/951ca1841f29114b969b57b26c7d3e80a39f75a0/trl/trainer/ppo_trainer.py#L837
@@ -159,6 +205,7 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
     data.batch['token_level_rewards'] = token_level_rewards
 
     metrics = {'critic/kl': current_kl, 'critic/kl_coeff': beta}
+    metrics.update(dgpo_metrics)
 
     return data, metrics
 
@@ -717,6 +764,38 @@ def validate_tcod_config(config):
     )
 
 
+def validate_dgpo_config(config):
+    """Reject settings that do not implement the released Agentic-RAG DGPO objective."""
+    dgpo_config = config.algorithm.get('dgpo', {})
+    if not dgpo_config.get('enable', False):
+        return
+
+    if config.algorithm.adv_estimator != 'gae':
+        raise ValueError('official DGPO uses PPO with GAE, so adv_estimator must be gae')
+    if config.actor_rollout_ref.actor.strategy != 'fsdp':
+        raise ValueError('DGPO with an independent teacher currently supports FSDP only')
+    if not config.actor_rollout_ref.ref.get('model_path'):
+        raise ValueError('DGPO requires actor_rollout_ref.ref.model_path to be the teacher checkpoint')
+    if config.actor_rollout_ref.actor.use_kl_loss:
+        raise ValueError('DGPO applies selective reward-side KL; actor.use_kl_loss must be false')
+    if config.algorithm.kl_penalty != 'kl':
+        raise ValueError('official DGPO uses the forward KL estimator algorithm.kl_penalty=kl')
+    if config.algorithm.kl_ctrl.type != 'fixed':
+        raise ValueError('official DGPO uses a fixed teacher KL coefficient')
+    if float(config.algorithm.kl_ctrl.kl_coef) < 0:
+        raise ValueError('DGPO teacher KL coefficient must be non-negative')
+    if config.do_search and not config.actor_rollout_ref.actor.state_masking:
+        raise ValueError('DGPO search training requires state_masking=true for retrieved tokens')
+    if config.actor_rollout_ref.rollout.n != 1:
+        raise ValueError('official DGPO PPO uses rollout.n=1')
+    if config.actor_rollout_ref.rollout.n_agent != 1:
+        raise ValueError('official DGPO PPO uses rollout.n_agent=1')
+
+    reward_threshold = float(dgpo_config.get('reward_threshold', 0.1))
+    if not np.isfinite(reward_threshold) or reward_threshold <= 0:
+        raise ValueError('DGPO reward_threshold must be finite and positive')
+
+
 class RayPPOTrainer(object):
     """
     Note that this trainer runs on the driver process on a single CPU/GPU node.
@@ -750,6 +829,7 @@ class RayPPOTrainer(object):
         self.resource_pool_manager = resource_pool_manager
         self.use_reference_policy = Role.RefPolicy in role_worker_mapping
         self.use_opd = config.algorithm.adv_estimator == 'opd'
+        self.use_dgpo = bool(config.algorithm.get('dgpo', {}).get('enable', False))
         self.use_rm = Role.RewardModel in role_worker_mapping and not self.use_opd
         self.ray_worker_group_cls = ray_worker_group_cls
         self.opd_diagnostics = None
@@ -772,6 +852,10 @@ class RayPPOTrainer(object):
                     trainer_config=config.trainer,
                     opd_config=config.algorithm.opd,
                 )
+
+        if self.use_dgpo and not self.config.trainer.get('val_only', False):
+            assert self.use_reference_policy, 'DGPO requires a teacher/reference policy'
+            validate_dgpo_config(config)
 
         # define KL control
         if self.use_reference_policy:
@@ -1631,9 +1715,18 @@ class RayPPOTrainer(object):
                             batch.batch['token_level_scores'] = reward_tensor
 
                             if not self.config.actor_rollout_ref.actor.use_kl_loss:
+                                dgpo_config = self.config.algorithm.get('dgpo', {})
                                 batch, kl_metrics = apply_kl_penalty(batch,
                                                                      kl_ctrl=self.kl_ctrl,
-                                                                     kl_penalty=self.config.algorithm.kl_penalty)
+                                                                     kl_penalty=self.config.algorithm.kl_penalty,
+                                                                     dgpo_selective_kl=bool(
+                                                                         dgpo_config.get('enable', False)
+                                                                     ),
+                                                                     dgpo_reward_threshold=float(
+                                                                         dgpo_config.get(
+                                                                             'reward_threshold', 0.1
+                                                                         )
+                                                                     ))
                                 metrics.update(kl_metrics)
                             else:
                                 batch.batch['token_level_rewards'] = batch.batch['token_level_scores']

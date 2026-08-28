@@ -133,13 +133,19 @@ def main_task(config):
     from verl.utils import hf_tokenizer
     tokenizer = hf_tokenizer(local_path)
 
-    if config.algorithm.adv_estimator == 'opd':
+    use_dgpo = bool(config.algorithm.get('dgpo', {}).get('enable', False))
+    if config.algorithm.adv_estimator == 'opd' or use_dgpo:
         if config.actor_rollout_ref.actor.strategy != 'fsdp':
-            raise NotImplementedError('OPD with an independent teacher currently supports the FSDP strategy only')
+            raise NotImplementedError(
+                'training with an independent teacher currently supports the FSDP strategy only'
+            )
 
         teacher_path = config.actor_rollout_ref.ref.model_path
         if not teacher_path:
-            raise ValueError('OPD requires actor_rollout_ref.ref.model_path to point to the teacher checkpoint')
+            method = 'DGPO' if use_dgpo else 'OPD'
+            raise ValueError(
+                f'{method} requires actor_rollout_ref.ref.model_path to point to the teacher checkpoint'
+            )
 
         teacher_local_path = copy_local_path_from_hdfs(teacher_path)
         teacher_tokenizer = hf_tokenizer(teacher_local_path)
