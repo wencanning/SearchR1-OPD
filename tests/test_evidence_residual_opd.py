@@ -5,8 +5,10 @@ import torch
 from omegaconf import OmegaConf
 
 from verl.trainer.ppo.ray_trainer import (
+    compute_tcod_f2b_turns,
     validate_opd_teacher_target_config,
     validate_sod_config,
+    validate_tcod_config,
 )
 from verl.workers.actor.dp_actor import (
     DataParallelPPOActor,
@@ -376,6 +378,76 @@ class SODConfigTest(unittest.TestCase):
         config.algorithm.opd.rce.enable = True
         with self.assertRaisesRegex(ValueError, 'SOD and RCE'):
             validate_sod_config(config)
+
+
+class TCODConfigTest(unittest.TestCase):
+    @staticmethod
+    def _config():
+        return OmegaConf.create({
+            'max_turns': 4,
+            'do_search': True,
+            'algorithm': {
+                'opd': {
+                    'teacher_target': 'observed',
+                    'advantage_mode': 'token',
+                    'normalize': False,
+                    'clip_value': None,
+                    'distillation_coef': 1.0,
+                    'lambda_distill': 1.0,
+                    'grpo_reward_coef': 0.0,
+                    'use_gated_distillation': False,
+                    'mask_protocol_tags': False,
+                    'rce': {'enable': False},
+                    'sod': {'enable': False},
+                    'tcod': {
+                        'enable': True,
+                        'variant': 'f2b',
+                        'start_turns': 1,
+                        'checkpoint_steps': 25,
+                    },
+                },
+            },
+            'actor_rollout_ref': {
+                'actor': {
+                    'state_masking': True,
+                    'entropy_coeff': 0.0,
+                    'ppo_epochs': 1,
+                },
+                'rollout': {
+                    'n': 1,
+                    'n_agent': 1,
+                },
+            },
+        })
+
+    def test_150_step_four_turn_curriculum(self):
+        expected = {
+            1: 1,
+            25: 1,
+            26: 2,
+            50: 2,
+            51: 3,
+            75: 3,
+            76: 4,
+            150: 4,
+        }
+        for step, turns in expected.items():
+            self.assertEqual(compute_tcod_f2b_turns(step, 4, 25), turns)
+
+    def test_official_tcod_f2b_config_is_accepted(self):
+        validate_tcod_config(self._config())
+
+    def test_tcod_rejects_grpo_mixing(self):
+        config = self._config()
+        config.algorithm.opd.grpo_reward_coef = 1.0
+        with self.assertRaisesRegex(ValueError, 'pure OPD'):
+            validate_tcod_config(config)
+
+    def test_tcod_rejects_b2f_without_teacher_trajectory_replay(self):
+        config = self._config()
+        config.algorithm.opd.tcod.variant = 'b2f'
+        with self.assertRaisesRegex(ValueError, 'replayable successful teacher trajectories'):
+            validate_tcod_config(config)
 
 
 class _FakeTokenizer:

@@ -639,6 +639,84 @@ def validate_sod_config(config):
         raise ValueError('SOD requires a positive distillation coefficient')
 
 
+def compute_tcod_f2b_turns(global_step, max_turns, checkpoint_steps, start_turns=1):
+    """Return TCOD-F2B's training horizon for a one-indexed trainer step.
+
+    The official curriculum is ``k = k_start + floor(n / eta)``. Search-R1's
+    trainer reports steps from one, so ``n`` is represented by
+    ``global_step - 1`` here. The result is capped at the evaluation horizon.
+    """
+    if global_step < 1:
+        raise ValueError('TCOD global_step must be one-indexed and positive')
+    if max_turns < 1:
+        raise ValueError('TCOD max_turns must be positive')
+    if checkpoint_steps < 1:
+        raise ValueError('TCOD checkpoint_steps must be positive')
+    if start_turns < 1 or start_turns > max_turns:
+        raise ValueError('TCOD start_turns must be in [1, max_turns]')
+    return min(
+        start_turns + ((global_step - 1) // checkpoint_steps),
+        max_turns,
+    )
+
+
+def validate_tcod_config(config):
+    """Reject settings that deviate from the official TCOD-F2B objective."""
+    opd_config = config.algorithm.opd
+    tcod_config = opd_config.get('tcod', {})
+    if not tcod_config.get('enable', False):
+        return
+
+    if str(tcod_config.get('variant', 'f2b')).lower() != 'f2b':
+        raise ValueError(
+            'this Search-R1 migration supports official TCOD-F2B only; '
+            'TCOD-B2F requires replayable successful teacher trajectories'
+        )
+    if opd_config.get('teacher_target', 'observed') != 'observed':
+        raise ValueError('TCOD requires the ordinary observed teacher target')
+    if not config.do_search:
+        raise ValueError('TCOD requires multi-turn search-agent trajectories')
+    if not config.actor_rollout_ref.actor.state_masking:
+        raise ValueError('TCOD requires state_masking=true for multi-turn OPD')
+    if opd_config.advantage_mode != 'token':
+        raise ValueError('TCOD requires advantage_mode=token')
+    if opd_config.normalize:
+        raise ValueError('TCOD requires normalize=false')
+    if opd_config.clip_value is not None:
+        raise ValueError('TCOD requires clip_value=null')
+    if float(opd_config.get('grpo_reward_coef', 0.0)) != 0.0:
+        raise ValueError('official TCOD uses pure OPD, so grpo_reward_coef must be zero')
+    if opd_config.get('use_gated_distillation', False):
+        raise ValueError('official TCOD does not use the legacy sigmoid distillation gate')
+    if opd_config.get('rce', {}).get('enable', False):
+        raise ValueError('TCOD and RCE weighting cannot be enabled together')
+    if opd_config.get('sod', {}).get('enable', False):
+        raise ValueError('TCOD and SOD cannot be enabled together')
+    if opd_config.get('mask_protocol_tags', False):
+        raise ValueError('TCOD requires distillation over all assistant tokens')
+    if config.actor_rollout_ref.actor.entropy_coeff != 0:
+        raise ValueError('TCOD requires actor entropy_coeff=0')
+    if config.actor_rollout_ref.actor.ppo_epochs != 1:
+        raise ValueError('TCOD requires one policy epoch per rollout batch')
+    if config.actor_rollout_ref.rollout.n != 1:
+        raise ValueError('TCOD requires rollout.n=1')
+    if config.actor_rollout_ref.rollout.n_agent != 1:
+        raise ValueError('official pure-OPD TCOD requires rollout.n_agent=1')
+
+    lambda_distill = opd_config.get('lambda_distill')
+    if lambda_distill is None:
+        lambda_distill = opd_config.get('distillation_coef', 1.0)
+    if float(lambda_distill) <= 0:
+        raise ValueError('TCOD requires a positive distillation coefficient')
+
+    compute_tcod_f2b_turns(
+        global_step=1,
+        max_turns=int(config.max_turns),
+        checkpoint_steps=int(tcod_config.get('checkpoint_steps', 25)),
+        start_turns=int(tcod_config.get('start_turns', 1)),
+    )
+
+
 class RayPPOTrainer(object):
     """
     Note that this trainer runs on the driver process on a single CPU/GPU node.
@@ -684,6 +762,7 @@ class RayPPOTrainer(object):
                 'Search OPD requires actor.state_masking=true to exclude observation tokens'
             validate_opd_teacher_target_config(config)
             validate_sod_config(config)
+            validate_tcod_config(config)
             if config.algorithm.opd.grpo_reward_coef != 0:
                 group_size = config.actor_rollout_ref.rollout.n_agent * config.actor_rollout_ref.rollout.n
                 assert group_size > 1, 'OPD + GRPO reward requires more than one rollout per prompt'
@@ -1335,6 +1414,24 @@ class RayPPOTrainer(object):
                 print(f'epoch {epoch}, step {self.global_steps}')
                 metrics = {}
                 timing_raw = {}
+
+                tcod_config = self.config.algorithm.opd.get('tcod', {})
+                if tcod_config.get('enable', False):
+                    curriculum_turns = compute_tcod_f2b_turns(
+                        global_step=self.global_steps,
+                        max_turns=int(self.config.max_turns),
+                        checkpoint_steps=int(tcod_config.get('checkpoint_steps', 25)),
+                        start_turns=int(tcod_config.get('start_turns', 1)),
+                    )
+                    generation_manager.config.max_turns = curriculum_turns
+                    metrics.update({
+                        'tcod/curriculum_turns': float(curriculum_turns),
+                        'tcod/full_horizon': float(curriculum_turns == self.config.max_turns),
+                    })
+                    print(
+                        f'[TCOD-F2B] step={self.global_steps} '
+                        f'train_max_turns={curriculum_turns}/{self.config.max_turns}'
+                    )
 
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
                 if self.config.do_search:

@@ -225,6 +225,13 @@ algorithm:
       enable: false
       epsilon: 1.0e-6
       delta: 0.2
+    # TCOD-F2B: progressively expose the student to a longer interaction
+    # horizon. Validation keeps using the full top-level max_turns value.
+    tcod:
+      enable: false
+      variant: f2b
+      start_turns: 1
+      checkpoint_steps: 25
     diagnostics:
       enable: false
       output_dir: null
