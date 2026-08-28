@@ -765,13 +765,13 @@ def validate_tcod_config(config):
 
 
 def validate_dgpo_config(config):
-    """Reject settings that do not implement the released Agentic-RAG DGPO objective."""
+    """Validate DGPO selective-teacher-guidance settings."""
     dgpo_config = config.algorithm.get('dgpo', {})
     if not dgpo_config.get('enable', False):
         return
 
-    if config.algorithm.adv_estimator != 'gae':
-        raise ValueError('official DGPO uses PPO with GAE, so adv_estimator must be gae')
+    if config.algorithm.adv_estimator not in {'gae', 'grpo'}:
+        raise ValueError('DGPO selective teacher guidance supports gae or grpo advantages')
     if config.actor_rollout_ref.actor.strategy != 'fsdp':
         raise ValueError('DGPO with an independent teacher currently supports FSDP only')
     if not config.actor_rollout_ref.ref.get('model_path'):
@@ -787,9 +787,14 @@ def validate_dgpo_config(config):
     if config.do_search and not config.actor_rollout_ref.actor.state_masking:
         raise ValueError('DGPO search training requires state_masking=true for retrieved tokens')
     if config.actor_rollout_ref.rollout.n != 1:
-        raise ValueError('official DGPO PPO uses rollout.n=1')
-    if config.actor_rollout_ref.rollout.n_agent != 1:
-        raise ValueError('official DGPO PPO uses rollout.n_agent=1')
+        raise ValueError('DGPO uses rollout.n=1; set group multiplicity with rollout.n_agent')
+    if config.actor_rollout_ref.rollout.n_agent < 1:
+        raise ValueError('DGPO rollout.n_agent must be positive')
+    if (
+        config.algorithm.adv_estimator == 'grpo'
+        and config.actor_rollout_ref.rollout.n_agent < 2
+    ):
+        raise ValueError('DGPO+GRPO requires at least two trajectories per prompt')
 
     reward_threshold = float(dgpo_config.get('reward_threshold', 0.1))
     if not np.isfinite(reward_threshold) or reward_threshold <= 0:

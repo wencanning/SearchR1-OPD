@@ -1,5 +1,6 @@
 import unittest
 
+import numpy as np
 import torch
 from omegaconf import OmegaConf
 
@@ -7,6 +8,7 @@ from verl import DataProto
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.ray_trainer import (
     apply_kl_penalty,
+    compute_advantage,
     create_dgpo_reward_mask,
     validate_dgpo_config,
 )
@@ -87,6 +89,22 @@ class DGPOSelectiveKLTest(unittest.TestCase):
         self.assertNotIn('dgpo/incorrect_trajectory_fraction', metrics)
         self.assertAlmostEqual(metrics['critic/kl'], 0.5)
 
+    def test_selective_teacher_reward_is_group_normalized_by_grpo(self):
+        batch = self._batch()
+        batch.non_tensor_batch['uid'] = np.array(['prompt', 'prompt'], dtype=object)
+        batch, _ = apply_kl_penalty(
+            batch,
+            kl_ctrl=core_algos.FixedKLController(kl_coef=0.001),
+            kl_penalty='kl',
+            dgpo_selective_kl=True,
+            dgpo_reward_threshold=0.1,
+        )
+
+        output = compute_advantage(batch, adv_estimator='grpo')
+
+        self.assertTrue(torch.all(output.batch['advantages'][0] < 0))
+        self.assertTrue(torch.all(output.batch['advantages'][1] > 0))
+
 
 class DGPOConfigTest(unittest.TestCase):
     @staticmethod
@@ -113,10 +131,21 @@ class DGPOConfigTest(unittest.TestCase):
     def test_official_dgpo_online_config_is_accepted(self):
         validate_dgpo_config(self._config())
 
-    def test_dgpo_rejects_grpo_advantages(self):
+    def test_dgpo_accepts_er_opd_rollout_multiplicity(self):
+        config = self._config()
+        config.actor_rollout_ref.rollout.n_agent = 8
+        validate_dgpo_config(config)
+
+    def test_dgpo_accepts_grpo_with_group_rollouts(self):
         config = self._config()
         config.algorithm.adv_estimator = 'grpo'
-        with self.assertRaisesRegex(ValueError, 'PPO with GAE'):
+        config.actor_rollout_ref.rollout.n_agent = 8
+        validate_dgpo_config(config)
+
+    def test_dgpo_rejects_grpo_without_group_rollouts(self):
+        config = self._config()
+        config.algorithm.adv_estimator = 'grpo'
+        with self.assertRaisesRegex(ValueError, 'at least two trajectories'):
             validate_dgpo_config(config)
 
     def test_dgpo_requires_an_independent_teacher(self):
