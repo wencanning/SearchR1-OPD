@@ -27,6 +27,8 @@ class _FakeCausalLM(torch.nn.Module):
         super().__init__()
         self.embedding = torch.nn.Embedding(32, hidden_size)
         self.lm_head = torch.nn.Linear(hidden_size, vocab_size, bias=False)
+        self.last_input_shape = None
+        self.last_attention_mask = None
 
     def get_output_embeddings(self):
         return self.lm_head
@@ -39,7 +41,9 @@ class _FakeCausalLM(torch.nn.Module):
         use_cache,
         num_logits_to_keep,
     ):
-        del attention_mask, position_ids, use_cache
+        self.last_input_shape = tuple(input_ids.shape)
+        self.last_attention_mask = attention_mask.detach().clone()
+        del position_ids, use_cache
         hidden_states = self.embedding(input_ids)[:, -num_logits_to_keep:]
         return SimpleNamespace(logits=self.lm_head(hidden_states))
 from verl.utils.evidence_residual import (
@@ -113,6 +117,104 @@ class EvidenceResidualTargetTest(unittest.TestCase):
             (input_ids[:, 2:], attention_mask[:, 2:], position_ids[:, 2:], evidence_mask[:, 2:]),
         ):
             torch.testing.assert_close(actual, expected)
+
+    def test_padded_observed_target_matches_teacher_distribution(self):
+        torch.manual_seed(5)
+        model = _FakeCausalLM()
+        actor = DataParallelPPOActor.__new__(DataParallelPPOActor)
+        actor.config = OmegaConf.create({
+            'target_forward_dtype': 'fp32',
+            'target_select_policy_logits': True,
+            'target_trim_shared_prompt_padding': False,
+            'allow_tf32': False,
+        })
+        actor.actor_module = model
+        actor.logit_vocab_size = 7
+        input_ids = torch.tensor([[1, 2, 3, 4, 5, 6]])
+        attention_mask = torch.ones_like(input_ids)
+        position_ids = torch.arange(input_ids.size(-1)).unsqueeze(0)
+        responses = torch.tensor([[4, 5, 6]])
+        loss_mask = torch.tensor([[True, False, True]])
+
+        with torch.no_grad():
+            full_logits = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                use_cache=False,
+                num_logits_to_keep=4,
+            ).logits[:, :-1]
+            selected_logits = full_logits[loss_mask].float()
+            expected_all_log_probs = torch.log_softmax(selected_logits, dim=-1)
+            expected_log_probs = expected_all_log_probs.gather(
+                -1, responses[loss_mask].unsqueeze(-1)
+            ).squeeze(-1)
+            expected_entropy = -(
+                expected_all_log_probs.exp() * expected_all_log_probs
+            ).sum(dim=-1)
+            output = actor._forward_teacher_target_micro_batch(
+                micro_batch={
+                    'input_ids': input_ids,
+                    'attention_mask': attention_mask,
+                    'position_ids': position_ids,
+                    'responses': responses,
+                    'loss_mask': loss_mask,
+                },
+                target_mode='observed',
+                entropy_matched_tau=None,
+                token_chunk_size=1,
+            )
+
+        torch.testing.assert_close(
+            output['ref_log_prob'][loss_mask], expected_log_probs
+        )
+        torch.testing.assert_close(
+            output['ref_entropy'][loss_mask], expected_entropy
+        )
+        self.assertTrue(torch.equal(
+            output['ref_log_prob'][~loss_mask], torch.zeros(1)
+        ))
+        self.assertTrue(torch.equal(
+            output['ref_entropy'][~loss_mask], torch.zeros(1)
+        ))
+
+    def test_padded_observed_target_retains_micro_batch_boundaries(self):
+        model = _FakeCausalLM()
+        actor = DataParallelPPOActor.__new__(DataParallelPPOActor)
+        actor.config = OmegaConf.create({
+            'target_forward_dtype': 'fp32',
+            'target_select_policy_logits': True,
+            'target_trim_shared_prompt_padding': False,
+            'allow_tf32': False,
+        })
+        actor.actor_module = model
+        actor.logit_vocab_size = 7
+        input_ids = torch.tensor([
+            [0, 0, 1, 2, 3, 4],
+            [5, 6, 7, 8, 9, 10],
+        ])
+        attention_mask = torch.tensor([
+            [0, 0, 1, 1, 1, 1],
+            [1, 1, 1, 1, 1, 1],
+        ])
+
+        with torch.no_grad():
+            output = actor._forward_teacher_target_micro_batch(
+                micro_batch={
+                    'input_ids': input_ids,
+                    'attention_mask': attention_mask,
+                    'position_ids': torch.arange(6).repeat(2, 1),
+                    'responses': torch.tensor([[2, 3, 4], [1, 2, 3]]),
+                    'loss_mask': torch.ones((2, 3), dtype=torch.bool),
+                },
+                target_mode='observed',
+                entropy_matched_tau=None,
+                token_chunk_size=2,
+            )
+
+        self.assertEqual(model.last_input_shape, (2, 6))
+        torch.testing.assert_close(model.last_attention_mask, attention_mask)
+        self.assertEqual(output['ref_log_prob'].shape, (2, 3))
 
     def test_hidden_mask_preserves_slots_and_blocks_only_evidence_key_columns(self):
         attention_mask = torch.tensor([[0, 1, 1, 1]])
@@ -278,6 +380,21 @@ class TeacherTargetConfigTest(unittest.TestCase):
     def test_er_config_accepts_pure_token_opd(self):
         validate_opd_teacher_target_config(self._config())
 
+    def test_standard_observed_config_keeps_legacy_backend(self):
+        validate_opd_teacher_target_config(self._config('observed'))
+
+    def test_padded_observed_config_enforces_strict_target_invariants(self):
+        config = self._config('observed')
+        config.actor_rollout_ref.ref.observed_target_backend = 'padded'
+        validate_opd_teacher_target_config(config)
+
+    def test_padded_observed_config_rejects_remove_padding_attention_backend(self):
+        config = self._config('observed')
+        config.actor_rollout_ref.ref.observed_target_backend = 'padded'
+        config.actor_rollout_ref.ref.attn_implementation = 'flash_attention_2'
+        with self.assertRaisesRegex(ValueError, 'attn_implementation=sdpa'):
+            validate_opd_teacher_target_config(config)
+
     def test_er_config_accepts_grpo_with_group_rollouts(self):
         config = self._config()
         config.algorithm.opd.grpo_reward_coef = 1.0
@@ -355,6 +472,9 @@ class SODConfigTest(unittest.TestCase):
                     'entropy_coeff': 0.0,
                     'ppo_epochs': 1,
                 },
+                'ref': {
+                    'observed_target_backend': 'padded',
+                },
             },
         })
 
@@ -377,6 +497,12 @@ class SODConfigTest(unittest.TestCase):
         config = self._config()
         config.algorithm.opd.rce.enable = True
         with self.assertRaisesRegex(ValueError, 'SOD and RCE'):
+            validate_sod_config(config)
+
+    def test_sod_rejects_standard_observed_target_backend(self):
+        config = self._config()
+        config.actor_rollout_ref.ref.observed_target_backend = 'standard'
+        with self.assertRaisesRegex(ValueError, 'observed_target_backend=padded'):
             validate_sod_config(config)
 
 

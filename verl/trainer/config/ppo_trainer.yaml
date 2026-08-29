@@ -65,6 +65,10 @@ actor_rollout_ref:
   ref:
     # Optional independent teacher checkpoint. Defaults to actor model.path.
     model_path: null
+    # Ordinary observed targets use the legacy log-prob path by default. The
+    # padded backend scores only policy-token rows with the real attention mask
+    # and computes normalization statistics in FP32; SOD opts into it.
+    observed_target_backend: standard
     # Evidence interventions require sdpa so a per-sample 4D additive mask is honored.
     attn_implementation: flash_attention_2
     # Strict ER/control launchers override all three precision settings to FP32.

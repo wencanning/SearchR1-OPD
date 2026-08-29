@@ -94,6 +94,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.restrict_to_tokenizer_vocab=true \
     actor_rollout_ref.rollout.n=1 \
     actor_rollout_ref.rollout.n_agent="$SOD_N_AGENT" \
+    actor_rollout_ref.ref.observed_target_backend=padded \
     actor_rollout_ref.ref.log_prob_micro_batch_size="$SOD_REF_LOG_PROB_MICRO_BATCH_SIZE" \
     actor_rollout_ref.ref.log_prob_use_dynamic_bsz=false \
     actor_rollout_ref.ref.fsdp_config.param_offload=false \

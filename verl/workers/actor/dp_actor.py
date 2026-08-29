@@ -400,7 +400,21 @@ class DataParallelPPOActor(BasePPOActor):
             restored[target_row_mask] = values
             return restored
 
-        if target_mode == 'evidence_residual':
+        if target_mode == 'observed':
+            # This is mathematically the ordinary teacher distribution. Unlike
+            # compute_log_prob's remove-padding path, it retains the per-example
+            # attention mask and normalizes selected FP16/BF16 logits in FP32.
+            stats = compute_temperature_target_stats(
+                observed_logits=observed_logits,
+                labels=target_labels,
+                temperature=1.0,
+                token_chunk_size=token_chunk_size,
+            )
+            output = {
+                'ref_log_prob': restore_response_shape(stats['target_log_prob']),
+                'ref_entropy': restore_response_shape(stats['target_entropy']),
+            }
+        elif target_mode == 'evidence_residual':
             hidden_attention_mask = build_evidence_hidden_attention_mask(
                 attention_mask=attention_mask,
                 evidence_mask=evidence_mask,
@@ -453,7 +467,7 @@ class DataParallelPPOActor(BasePPOActor):
                                         target_mode: str,
                                         entropy_matched_tau: float = None,
                                         token_chunk_size: int = 16):
-        """Score an evidence-residual or entropy-matched teacher target."""
+        """Score an observed, evidence-residual, or entropy-matched target."""
         if self.use_ulysses_sp:
             raise ValueError('intervened teacher targets require ulysses_sequence_parallel_size=1')
         self.actor_module.eval()

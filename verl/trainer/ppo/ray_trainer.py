@@ -541,14 +541,22 @@ def _timer(name: str, timing_raw: Dict[str, float]):
 
 
 def validate_opd_teacher_target_config(config):
-    """Validate invariants that keep intervened targets as the only variable."""
+    """Validate invariants for padded/intervened teacher-target execution."""
     opd_config = config.algorithm.opd
     target_mode = opd_config.get('teacher_target', 'observed')
     supported_modes = {'observed', 'evidence_residual', 'entropy_matched'}
     if target_mode not in supported_modes:
         raise ValueError(f'Unsupported OPD teacher_target: {target_mode}')
-    if target_mode == 'observed':
+    observed_target_backend = config.actor_rollout_ref.ref.get(
+        'observed_target_backend', 'standard'
+    )
+    if target_mode == 'observed' and observed_target_backend == 'standard':
         return
+    if target_mode == 'observed' and observed_target_backend != 'padded':
+        raise ValueError(
+            'ref.observed_target_backend must be standard or padded; '
+            f'got {observed_target_backend}'
+        )
 
     if not config.do_search:
         raise ValueError(f'{target_mode} requires search-agent trajectories')
@@ -650,6 +658,11 @@ def validate_sod_config(config):
 
     if opd_config.get('teacher_target', 'observed') != 'observed':
         raise ValueError('SOD requires the ordinary observed teacher target')
+    if config.actor_rollout_ref.ref.get('observed_target_backend', 'standard') != 'padded':
+        raise ValueError(
+            'SOD requires ref.observed_target_backend=padded so SDPA preserves '
+            'micro-batch attention boundaries'
+        )
     if not config.do_search:
         raise ValueError('SOD requires multi-step search-agent trajectories')
     if not config.actor_rollout_ref.actor.state_masking:
@@ -1683,6 +1696,12 @@ class RayPPOTrainer(object):
                             teacher_target = self.config.algorithm.opd.get('teacher_target', 'observed')
                             metrics['opd/teacher_target_is_intervened'] = float(
                                 teacher_target != 'observed')
+                            if teacher_target == 'observed':
+                                metrics['opd/observed_target_backend_is_padded'] = float(
+                                    self.config.actor_rollout_ref.ref.get(
+                                        'observed_target_backend', 'standard'
+                                    ) == 'padded'
+                                )
                             if teacher_target == 'entropy_matched':
                                 metrics['opd/entropy_matched_tau'] = float(
                                     self.config.algorithm.opd.entropy_matched_tau)

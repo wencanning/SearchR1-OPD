@@ -525,13 +525,21 @@ class ActorRolloutRefWorker(Worker):
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data)
             target_mode = data.meta_info.get('opd_teacher_target', 'observed')
-            if target_mode == 'observed':
+            observed_target_backend = self.config.ref.get(
+                'observed_target_backend', 'standard'
+            )
+            if target_mode == 'observed' and observed_target_backend == 'standard':
                 ref_log_prob, ref_entropy = self.ref_policy.compute_log_prob(data=data, return_entropy=True)
                 output_tensors = {
                     'ref_log_prob': ref_log_prob,
                     'ref_entropy': ref_entropy,
                 }
             else:
+                if target_mode == 'observed' and observed_target_backend != 'padded':
+                    raise ValueError(
+                        'ref.observed_target_backend must be standard or padded; '
+                        f'got {observed_target_backend}'
+                    )
                 output_tensors = self.ref_policy.compute_teacher_target_log_prob(
                     data=data,
                     target_mode=target_mode,
