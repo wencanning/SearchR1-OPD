@@ -33,9 +33,9 @@ N_GPUS="2"
 # The legacy trainer starts at step 1 and stops after incrementing the counter;
 # 201 therefore executes optimizer updates 1 through 200.
 TOTAL_TRAINING_STEPS="201"
-TRAIN_BATCH_SIZE="128"
+TRAIN_BATCH_SIZE="512"
 VAL_BATCH_SIZE="512"
-PPO_MINI_BATCH_SIZE="128"
+PPO_MINI_BATCH_SIZE="256"
 ACTOR_PPO_MICRO_BATCH_SIZE="8"
 CRITIC_PPO_MICRO_BATCH_SIZE="8"
 ROLLOUT_LOG_PROB_MICRO_BATCH_SIZE="32"

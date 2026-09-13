@@ -8,9 +8,9 @@ set -euo pipefail
 export NO_PROXY="127.0.0.1,localhost"
 export no_proxy="127.0.0.1,localhost"
 
-# Formal-run values are deliberately fixed here.  Do not inherit stale exports
-# from earlier smoke tests in the parent shell.  Explicit Hydra overrides passed
-# through "$@" remain available for intentional one-off runs.
+# Core formal-run values are deliberately fixed here. Alpha and experiment name
+# are explicit environment hooks for controlled residual-strength ablations;
+# Hydra overrides passed through "$@" remain available for other one-off runs.
 export CUDA_VISIBLE_DEVICES="2,3"
 export VLLM_ATTENTION_BACKEND="XFORMERS"
 
@@ -18,9 +18,9 @@ DATA_DIR="data/nq_hotpotqa_train_30k_no_cold_start"
 VAL_FILE="data/nq_hotpotqa_train_30k_no_cold_start/validation_diagnostic_512.parquet"
 TRAIN_DATA_SOURCE="hotpotqa"
 VAL_DATA_SOURCE="null"
-STUDENT_MODEL="data/student/1B"
+STUDENT_MODEL="data/student/0.5B"
 TEACHER_MODEL="/data/home/wencanning/models/SearchR1-nq_hotpotqa_train-qwen2.5-7b-it-em-grpo-v0.3"
-EXPERIMENT_NAME="eropd-grpo-1B"
+EXPERIMENT_NAME="eropd-grpo-05B-test-alpha15"
 WAND_PROJECT="Search-R1-OPD2"
 N_GPUS="2"
 TOTAL_TRAINING_STEPS="201"
@@ -29,8 +29,9 @@ VAL_BATCH_SIZE="256"
 OPD_PPO_MINI_BATCH_SIZE="128"
 OPD_PPO_MICRO_BATCH_SIZE="8"
 OPD_ROLLOUT_LOG_PROB_MICRO_BATCH_SIZE="32"
-OPD_REF_LOG_PROB_MICRO_BATCH_SIZE="8"
-OPD_LAMBDA_DISTILL="1.0"
+OPD_REF_LOG_PROB_MICRO_BATCH_SIZE="16"
+OPD_LAMBDA_DISTILL="0.01"
+OPD_EVIDENCE_RESIDUAL_ALPHA="1.5"
 OPD_GRPO_REWARD_COEF="1.0"
 OPD_N_AGENT="8"
 OPD_TARGET_TOKEN_CHUNK_SIZE="512"
@@ -68,6 +69,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     algorithm.opd.mask_protocol_tags=false \
     algorithm.opd.lambda_distill="$OPD_LAMBDA_DISTILL" \
     algorithm.opd.teacher_target=evidence_residual \
+    algorithm.opd.evidence_residual_alpha="$OPD_EVIDENCE_RESIDUAL_ALPHA" \
     algorithm.opd.entropy_matched_tau=null \
     algorithm.opd.target_token_chunk_size="$OPD_TARGET_TOKEN_CHUNK_SIZE" \
     algorithm.opd.grpo_reward_coef="$OPD_GRPO_REWARD_COEF" \

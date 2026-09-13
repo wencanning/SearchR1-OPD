@@ -228,8 +228,14 @@ def compute_evidence_residual_target_stats(
     hidden_logits: torch.Tensor,
     labels: torch.Tensor,
     token_chunk_size: int = 16,
+    alpha: float = 1.0,
 ) -> Dict[str, torch.Tensor]:
-    """Compute ``softmax(2 * z_observed - z_hidden)`` in FP32.
+    """Compute the alpha-scaled evidence-residual target in FP32.
+
+    The target logits are
+    ``z_observed + alpha * (z_observed - z_hidden)``.  Therefore ``alpha=0``
+    recovers the ordinary observed teacher and ``alpha=1`` recovers the
+    original ``2 * z_observed - z_hidden`` target.
 
     The vocabulary dimension is always complete.  Chunking is only over token
     rows, limiting peak memory without changing the normalization.
@@ -240,6 +246,9 @@ def compute_evidence_residual_target_stats(
         raise ValueError('labels must match the batch and token dimensions of teacher logits')
     if token_chunk_size <= 0:
         raise ValueError('token_chunk_size must be positive')
+    alpha = float(alpha)
+    if not math.isfinite(alpha) or alpha < 0:
+        raise ValueError('alpha must be finite and non-negative')
 
     vocab_size = observed_logits.shape[-1]
     flat_observed = observed_logits.reshape(-1, vocab_size)
@@ -260,7 +269,7 @@ def compute_evidence_residual_target_stats(
         observed = flat_observed[start:end].float()
         hidden = flat_hidden[start:end].float()
         chunk_labels = flat_labels[start:end]
-        target = 2.0 * observed - hidden
+        target = observed + alpha * (observed - hidden)
 
         target_stats = _distribution_stats(target, chunk_labels)
         observed_stats = _distribution_stats(observed, chunk_labels)

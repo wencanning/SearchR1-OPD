@@ -19,6 +19,7 @@ This trainer supports model-agonistic model initialization with huggingface
 import os
 import copy
 import hashlib
+import math
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -643,6 +644,17 @@ def validate_opd_teacher_target_config(config):
         raise ValueError(f'{target_mode} requires a positive fixed lambda_distill')
     if opd_config.get('target_token_chunk_size', 0) <= 0:
         raise ValueError('target_token_chunk_size must be positive')
+    if target_mode == 'evidence_residual':
+        try:
+            evidence_residual_alpha = float(
+                opd_config.get('evidence_residual_alpha', 1.0)
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                'evidence_residual_alpha must be finite and non-negative'
+            ) from exc
+        if not math.isfinite(evidence_residual_alpha) or evidence_residual_alpha < 0:
+            raise ValueError('evidence_residual_alpha must be finite and non-negative')
     if target_mode == 'entropy_matched':
         tau = opd_config.get('entropy_matched_tau')
         if tau is None or tau <= 0:
@@ -992,6 +1004,9 @@ class RayPPOTrainer(object):
         data_source_lst = []
         total_val_steps = len(self.val_dataloader)
         print(f'[validation] total batches: {total_val_steps}')
+        val_do_sample = bool(
+            self.config.actor_rollout_ref.rollout.get('val_do_sample', False)
+        )
 
         gen_config = GenerationConfig(
             max_turns=self.config.max_turns,
@@ -1028,7 +1043,7 @@ class RayPPOTrainer(object):
                     'eos_token_id': self.tokenizer.eos_token_id,
                     'pad_token_id': self.tokenizer.pad_token_id,
                     'recompute_log_prob': False,
-                    'do_sample': False,
+                    'do_sample': val_do_sample,
                     'validate': True,
                 }
 
@@ -1062,7 +1077,7 @@ class RayPPOTrainer(object):
                     'eos_token_id': self.tokenizer.eos_token_id,
                     'pad_token_id': self.tokenizer.pad_token_id,
                     'recompute_log_prob': False,
-                    'do_sample': False,
+                    'do_sample': val_do_sample,
                     'validate': True,
                 }
                 with _timer('step', timing_raw):
@@ -1105,6 +1120,23 @@ class RayPPOTrainer(object):
         metric_dict = {}
         for data_source, rewards in data_source_reward.items():
             metric_dict[f'val/test_score/{data_source}'] = np.mean(rewards)
+
+        avg_data_sources = [
+            'nq',
+            'triviaqa',
+            'popqa',
+            'hotpotqa',
+            '2wikimultihopqa',
+            'musique',
+            'bamboogle',
+        ]
+        avg_scores = [
+            metric_dict[f'val/test_score/{data_source}']
+            for data_source in avg_data_sources
+            if f'val/test_score/{data_source}' in metric_dict
+        ]
+        if len(avg_scores) == len(avg_data_sources):
+            metric_dict['val/test_score/Avg'] = np.mean(avg_scores)
 
         return metric_dict
 
@@ -1205,6 +1237,8 @@ class RayPPOTrainer(object):
             calibration_batch.meta_info['opd_entropy_matched_tau'] = tau
             calibration_batch.meta_info['opd_target_token_chunk_size'] = \
                 self.config.algorithm.opd.get('target_token_chunk_size', 16)
+            calibration_batch.meta_info['opd_evidence_residual_alpha'] = \
+                self.config.algorithm.opd.get('evidence_residual_alpha', 1.0)
             output = self.ref_policy_wg.compute_ref_log_prob(calibration_batch)
             valid_output = unpad_dataproto(output, pad_size)
             valid_batch = unpad_dataproto(calibration_batch, pad_size)
@@ -1329,6 +1363,9 @@ class RayPPOTrainer(object):
             'student_model': str(self.config.actor_rollout_ref.model.path),
             'teacher_model': str(self.config.actor_rollout_ref.ref.model_path),
             'shared_vocab_size': len(self.tokenizer),
+            'evidence_residual_alpha': float(
+                self.config.algorithm.opd.get('evidence_residual_alpha', 1.0)
+            ),
         }
         calibration_fingerprint = hashlib.sha256(
             json.dumps(
@@ -1345,6 +1382,9 @@ class RayPPOTrainer(object):
             'student_model': str(self.config.actor_rollout_ref.model.path),
             'teacher_model': str(self.config.actor_rollout_ref.ref.model_path),
             'shared_vocab_size': len(self.tokenizer),
+            'evidence_residual_alpha': float(
+                self.config.algorithm.opd.get('evidence_residual_alpha', 1.0)
+            ),
             'data_source': data_source,
             'fraction': float(calibration_config.fraction),
             'split_seed': int(calibration_config.split_seed),
@@ -1474,7 +1514,11 @@ class RayPPOTrainer(object):
         """
 
         logger = self.logger
-        self.global_steps = 0
+        # Weight-only continuation: this offsets logging/checkpoint steps, but
+        # deliberately does not claim to restore optimizer or dataloader state.
+        self.global_steps = int(self.config.trainer.get('warm_start_step', 0))
+        if self.global_steps < 0 or (self.global_steps and self.global_steps >= self.total_training_steps - 1):
+            raise ValueError('warm_start_step must leave at least one training update')
         # perform validation before training
         # currently, we only support validation using the reward_function.
         if self.val_reward_fn is not None and self.config.trainer.get('val_before_train', True):
@@ -1634,6 +1678,10 @@ class RayPPOTrainer(object):
                                     self.config.algorithm.opd.get('entropy_matched_tau')
                                 batch.meta_info['opd_target_token_chunk_size'] = \
                                     self.config.algorithm.opd.get('target_token_chunk_size', 16)
+                                batch.meta_info['opd_evidence_residual_alpha'] = \
+                                    self.config.algorithm.opd.get(
+                                        'evidence_residual_alpha', 1.0
+                                    )
                             ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
 
@@ -1675,6 +1723,9 @@ class RayPPOTrainer(object):
                                 'distillation_coef': lambda_distill,
                                 'lambda_distill': lambda_distill,
                                 'teacher_target': self.config.algorithm.opd.get('teacher_target', 'observed'),
+                                'evidence_residual_alpha': self.config.algorithm.opd.get(
+                                    'evidence_residual_alpha', 1.0
+                                ),
                                 'grpo_reward_coef': self.config.algorithm.opd.grpo_reward_coef,
                                 'use_gated_distillation': self.config.algorithm.opd.get('use_gated_distillation', True),
                                 'gamma': self.config.algorithm.opd.get('gamma', 1.0),
@@ -1706,6 +1757,11 @@ class RayPPOTrainer(object):
                                 metrics['opd/entropy_matched_tau'] = float(
                                     self.config.algorithm.opd.entropy_matched_tau)
                             if teacher_target == 'evidence_residual':
+                                metrics['opd/evidence_residual_alpha'] = float(
+                                    self.config.algorithm.opd.get(
+                                        'evidence_residual_alpha', 1.0
+                                    )
+                                )
                                 evidence_mask = batch.batch['evidence_mask'].float()
                                 valid_context = batch.batch['attention_mask'].float()
                                 metrics['opd/evidence_context_token_fraction'] = (

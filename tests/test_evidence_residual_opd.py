@@ -264,6 +264,51 @@ class EvidenceResidualTargetTest(unittest.TestCase):
             (observed - hidden).gather(-1, labels.unsqueeze(-1)).squeeze(-1),
         )
 
+    def test_er_target_supports_requested_alpha_ablation(self):
+        observed = torch.tensor([[[1.0, 0.0, -1.0], [0.2, -0.5, 1.2]]])
+        hidden = torch.tensor([[[0.0, 0.5, -0.5], [-0.1, 0.3, 0.7]]])
+        labels = torch.tensor([[0, 2]])
+
+        for alpha in (0.0, 0.5, 1.0, 1.5, 2.0):
+            with self.subTest(alpha=alpha):
+                stats = compute_evidence_residual_target_stats(
+                    observed,
+                    hidden,
+                    labels,
+                    token_chunk_size=1,
+                    alpha=alpha,
+                )
+                expected_logits = observed + alpha * (observed - hidden)
+                expected_log_probs = torch.log_softmax(expected_logits, dim=-1)
+                expected_selected = expected_log_probs.gather(
+                    -1, labels.unsqueeze(-1)
+                ).squeeze(-1)
+                torch.testing.assert_close(
+                    stats['target_log_prob'], expected_selected
+                )
+                if alpha == 0.0:
+                    torch.testing.assert_close(
+                        stats['target_log_prob'], stats['observed_log_prob']
+                    )
+                    torch.testing.assert_close(
+                        stats['target_entropy'], stats['observed_entropy']
+                    )
+
+    def test_er_target_rejects_invalid_alpha(self):
+        observed = torch.zeros((1, 1, 2))
+        hidden = torch.zeros_like(observed)
+        labels = torch.tensor([[0]])
+
+        for alpha in (-0.1, float('nan'), float('inf')):
+            with self.subTest(alpha=alpha):
+                with self.assertRaisesRegex(ValueError, 'alpha'):
+                    compute_evidence_residual_target_stats(
+                        observed,
+                        hidden,
+                        labels,
+                        alpha=alpha,
+                    )
+
     def test_er_target_is_finite_for_large_vocab_and_wide_logits(self):
         vocab_size = 152064
         observed = torch.linspace(-80.0, 80.0, vocab_size).reshape(1, 1, -1)
@@ -347,6 +392,7 @@ class TeacherTargetConfigTest(unittest.TestCase):
                     'clip_value': None,
                     'grpo_reward_coef': 0.0,
                     'lambda_distill': 1.0,
+                    'evidence_residual_alpha': 1.0,
                     'target_token_chunk_size': 16,
                     'entropy_matched_tau': 0.7 if target == 'entropy_matched' else None,
                 },
@@ -379,6 +425,21 @@ class TeacherTargetConfigTest(unittest.TestCase):
 
     def test_er_config_accepts_pure_token_opd(self):
         validate_opd_teacher_target_config(self._config())
+
+    def test_er_config_accepts_requested_alpha_ablation(self):
+        for alpha in (0.0, 0.5, 1.0, 1.5, 2.0):
+            with self.subTest(alpha=alpha):
+                config = self._config()
+                config.algorithm.opd.evidence_residual_alpha = alpha
+                validate_opd_teacher_target_config(config)
+
+    def test_er_config_rejects_invalid_alpha(self):
+        for alpha in (-0.1, float('nan'), float('inf'), None):
+            with self.subTest(alpha=alpha):
+                config = self._config()
+                config.algorithm.opd.evidence_residual_alpha = alpha
+                with self.assertRaisesRegex(ValueError, 'evidence_residual_alpha'):
+                    validate_opd_teacher_target_config(config)
 
     def test_standard_observed_config_keeps_legacy_backend(self):
         validate_opd_teacher_target_config(self._config('observed'))

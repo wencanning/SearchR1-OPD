@@ -90,12 +90,16 @@ class vLLMRollout(BaseRollout):
 
         assert model_hf_config.max_position_embeddings >= config.prompt_length + config.response_length, \
             "model context length should be greater than total sequence length"
+        rollout_seed = config.get('seed')
+        if rollout_seed is None:
+            rollout_seed = 0
         self.inference_engine = LLM(actor_module,
                                     tokenizer=tokenizer,
                                     model_hf_config=model_hf_config,
                                     tensor_parallel_size=tensor_parallel_size,
                                     dtype=config.dtype,
                                     enforce_eager=config.enforce_eager,
+                                    seed=int(rollout_seed),
                                     gpu_memory_utilization=config.gpu_memory_utilization,
                                     skip_tokenizer_init=False,
                                     max_model_len=config.prompt_length + config.response_length,

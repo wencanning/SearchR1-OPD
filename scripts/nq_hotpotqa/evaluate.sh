@@ -1,18 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
 data_name=nq_hotpotqa_train
 
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-export DATA_DIR=data/${data_name} # first download the data from https://huggingface.co/datasets/PeterJinGo/nq_hotpotqa_train
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
+export DATA_DIR=${DATA_DIR:-data/${data_name}}
+VAL_FILE=${VAL_FILE:-$DATA_DIR/test.parquet}
+N_GPUS=${N_GPUS:-$(awk -F, '{print NF}' <<< "$CUDA_VISIBLE_DEVICES")}
+PYTHON_BIN=${PYTHON_BIN:-python3}
 
-export BASE_MODEL=""
+export BASE_MODEL=${BASE_MODEL:?Set BASE_MODEL to the checkpoint directory}
 
 # set -x
 export VLLM_ATTENTION_BACKEND=XFORMERS # vllm + qwen2-7b with flash_attn has some issues
 
 # max_prompt_length = (config['training']['max_start_length'] + config['training']['max_response_length'] * (config['training']['max_turns'] - 1) + config['training']['max_obs_length'] * config['training']['max_turns'])
 
-PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
+PYTHONUNBUFFERED=1 "$PYTHON_BIN" -m verl.trainer.main_ppo \
     data.train_files=$DATA_DIR/train.parquet \
-    data.val_files=$DATA_DIR/test.parquet \
+    data.val_files="$VAL_FILE" \
     data.train_data_num=null \
     data.val_data_num=null \
     data.train_batch_size=512 \
@@ -41,6 +46,8 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     actor_rollout_ref.rollout.n_agent=1 \
     actor_rollout_ref.rollout.temperature=1 \
+    actor_rollout_ref.rollout.seed="${EVAL_SEED:-42}" \
+    actor_rollout_ref.rollout.val_do_sample="${EVAL_DO_SAMPLE:-true}" \
     actor_rollout_ref.actor.state_masking=true \
     critic.optim.lr=1e-5 \
     critic.model.use_remove_padding=True \
@@ -58,8 +65,8 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     +trainer.val_only=true \
     +trainer.val_before_train=true \
     trainer.default_hdfs_dir=null \
-    trainer.n_gpus_per_node=8 \
+    trainer.n_gpus_per_node="$N_GPUS" \
     trainer.nnodes=1 \
     max_turns=4 \
-    retriever.url="http://127.0.0.1:8000/retrieve" \
-    retriever.topk=3
+    retriever.url="${RETRIEVER_URL:-http://127.0.0.1:8000/retrieve}" \
+    retriever.topk=3 "$@"

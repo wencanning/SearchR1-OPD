@@ -545,6 +545,9 @@ class ActorRolloutRefWorker(Worker):
                     target_mode=target_mode,
                     entropy_matched_tau=data.meta_info.get('opd_entropy_matched_tau'),
                     token_chunk_size=data.meta_info.get('opd_target_token_chunk_size', 16),
+                    evidence_residual_alpha=data.meta_info.get(
+                        'opd_evidence_residual_alpha', 1.0
+                    ),
                 )
             output = DataProto.from_dict(tensors=output_tensors)
             output = self.ulysses_sharding_manager.postprocess_data(output)

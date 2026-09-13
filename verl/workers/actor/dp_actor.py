@@ -347,7 +347,8 @@ class DataParallelPPOActor(BasePPOActor):
                                             micro_batch,
                                             target_mode: str,
                                             entropy_matched_tau: float,
-                                            token_chunk_size: int):
+                                            token_chunk_size: int,
+                                            evidence_residual_alpha: float = 1.0):
         response_length = micro_batch['responses'].size(-1)
         target_row_mask = micro_batch['loss_mask'].bool()
         if not torch.any(target_row_mask):
@@ -434,6 +435,7 @@ class DataParallelPPOActor(BasePPOActor):
                 hidden_logits=hidden_logits,
                 labels=target_labels,
                 token_chunk_size=token_chunk_size,
+                alpha=evidence_residual_alpha,
             )
             del hidden_logits
             output = {
@@ -466,7 +468,8 @@ class DataParallelPPOActor(BasePPOActor):
                                         data: DataProto,
                                         target_mode: str,
                                         entropy_matched_tau: float = None,
-                                        token_chunk_size: int = 16):
+                                        token_chunk_size: int = 16,
+                                        evidence_residual_alpha: float = 1.0):
         """Score an observed, evidence-residual, or entropy-matched target."""
         if self.use_ulysses_sp:
             raise ValueError('intervened teacher targets require ulysses_sequence_parallel_size=1')
@@ -493,6 +496,7 @@ class DataParallelPPOActor(BasePPOActor):
                     target_mode=target_mode,
                     entropy_matched_tau=entropy_matched_tau,
                     token_chunk_size=token_chunk_size,
+                    evidence_residual_alpha=evidence_residual_alpha,
                 )
             for key, value in micro_output.items():
                 output_lists.setdefault(key, []).append(value)

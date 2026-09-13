@@ -166,8 +166,13 @@ twice on the same token ids and position ids:
 ```text
 z_observed = teacher(full student trajectory)
 z_hidden   = teacher(same trajectory, retrieved-content key columns blocked)
-q_ER       = softmax(2 * z_observed - z_hidden)
+q_ER       = softmax(z_observed + alpha * (z_observed - z_hidden))
 ```
+
+`algorithm.opd.evidence_residual_alpha` is non-negative and defaults to `1.0`,
+which exactly preserves the original `2 * z_observed - z_hidden` target.
+`alpha=0` recovers ordinary observed OPD, while larger values amplify the
+evidence-induced logit residual.
 
 The hidden pass uses a per-sample 4D additive causal mask. Text inside
 `<information>...</information>` is hidden at every layer; the boundary tags,
@@ -221,6 +226,16 @@ DATA_DIR=/path/to/hotpotqa \
 STUDENT_MODEL=/path/to/Qwen2.5-1.5B-Instruct \
 TEACHER_MODEL=/path/to/Qwen2.5-7B-Instruct \
 ./train_er_opd.sh
+```
+
+Run the requested residual-strength ablation with isolated run/checkpoint names:
+
+```bash
+for alpha in 0 0.5 1 1.5 2; do
+  OPD_EVIDENCE_RESIDUAL_ALPHA="$alpha" \
+  EXPERIMENT_NAME="eropd-grpo-1B-alpha-${alpha}" \
+  ./train_er_opd.sh
+done
 ```
 
 ### Entropy-matched control

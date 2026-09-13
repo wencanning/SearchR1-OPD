@@ -30,6 +30,11 @@ def parse_args():
     parser.add_argument("--model", required=True)
     parser.add_argument("--tokenizer", default=None, help="Tokenizer path used to apply the chat template.")
     parser.add_argument("--retriever-url", default="http://127.0.0.1:8000/retrieve")
+    parser.add_argument(
+        "--input-parquet",
+        default=None,
+        help="Optional local training parquet. When set, samples are selected from this file instead of FlashRAG.",
+    )
     parser.add_argument("--data-sources", default="nq,hotpotqa")
     parser.add_argument("--split", default="train")
     parser.add_argument("--samples-per-source", default="5000",
@@ -79,9 +84,38 @@ def parse_per_source_counts(samples_per_source: str, data_sources: Sequence[str]
     return counts
 
 
-def load_samples(data_sources: Sequence[str], split: str, samples_per_source: str, seed: int) -> List[Dict]:
+def load_samples(data_sources: Sequence[str], split: str, samples_per_source: str, seed: int,
+                 input_parquet: str | None = None) -> List[Dict]:
     per_source_counts = parse_per_source_counts(samples_per_source, data_sources)
     samples = []
+
+    if input_parquet:
+        dataset = load_dataset("parquet", data_files={split: input_parquet}, split=split)
+        for data_source, count in zip(data_sources, per_source_counts):
+            source_idx = 0
+            for row_idx, example in enumerate(dataset):
+                if example.get("data_source") != data_source:
+                    continue
+                question = normalize_question(example["question"])
+                prompt = example.get("prompt") or build_prompt_messages(question)
+                ground_truth = example.get("reward_model", {}).get("ground_truth")
+                if not ground_truth:
+                    ground_truth = {"target": example["golden_answers"]}
+                example_split = example.get("extra_info", {}).get("split", split)
+                example_id = example.get("id", row_idx)
+                samples.append({
+                    "sample_id": f"{data_source}-{example_split}-{example_id}",
+                    "data_source": data_source,
+                    "split": example_split,
+                    "question": question,
+                    "prompt": prompt,
+                    "ground_truth": ground_truth,
+                })
+                source_idx += 1
+                if source_idx >= count:
+                    break
+        return samples
+
     for offset, (data_source, count) in enumerate(zip(data_sources, per_source_counts)):
         dataset = load_dataset("RUC-NLPIR/FlashRAG_datasets", data_source)
         resolved_split = resolve_split(dataset, split)
@@ -312,7 +346,13 @@ async def main_async(args):
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
 
     data_sources = [item.strip() for item in args.data_sources.split(",") if item.strip()]
-    samples = load_samples(data_sources, args.split, args.samples_per_source, args.seed)
+    samples = load_samples(
+        data_sources,
+        args.split,
+        args.samples_per_source,
+        args.seed,
+        input_parquet=args.input_parquet,
+    )
     processed_ids = load_processed_ids(raw_output_path)
     samples = [sample for sample in samples if sample["sample_id"] not in processed_ids]
 
@@ -363,6 +403,7 @@ async def main_async(args):
     summary = {
         "model": args.model,
         "tokenizer": tokenizer_name,
+        "input_parquet": args.input_parquet,
         "data_sources": data_sources,
         "samples_requested_per_source": dict(
             zip(data_sources, parse_per_source_counts(args.samples_per_source, data_sources))

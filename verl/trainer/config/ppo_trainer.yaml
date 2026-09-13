@@ -102,6 +102,8 @@ actor_rollout_ref:
     name: vllm
     temperature: 1.0
     seed: null
+    # Validation remains greedy unless explicitly enabled by evaluate_loop.sh.
+    val_do_sample: False
     # Intervened OPD targets require sampling only from tokenizer-defined IDs.
     restrict_to_tokenizer_vocab: False
     top_k: -1 # 0 for hf rollout, -1 for vllm rollout
@@ -208,9 +210,12 @@ algorithm:
     # Fixed coefficient used by evidence_residual and entropy_matched targets.
     # Null preserves distillation_coef for existing OPD configurations.
     lambda_distill: null
-    # observed: ordinary teacher; evidence_residual: softmax(2*z_obs-z_hidden);
+    # observed: ordinary teacher; evidence_residual uses
+    # softmax(z_obs + evidence_residual_alpha * (z_obs-z_hidden));
     # entropy_matched: softmax(z_obs/tau) with one pre-calibrated global tau.
     teacher_target: observed
+    # 0 recovers observed OPD; 1 recovers the original 2*z_obs-z_hidden target.
+    evidence_residual_alpha: 1.0
     entropy_matched_tau: null
     target_token_chunk_size: 16
     # Set > 0 to add group-normalized Search-R1 outcome reward to OPD.
