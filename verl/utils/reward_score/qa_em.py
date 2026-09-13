@@ -121,7 +121,7 @@ def compute_score_subem(solution_str, ground_truth, method='strict', format_scor
         score: the score for the correct answer
     """
     answer = extract_solution(solution_str=solution_str)
-    do_print = random.randint(1, 64) == 1
+    do_print = random.randint(1, 1024) == 1
     
     if do_print:
         print(f"--------------------------------")

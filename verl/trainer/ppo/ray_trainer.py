@@ -17,12 +17,16 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import os
+import copy
+import hashlib
+import math
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from pprint import pprint
 from typing import Type, Dict
+from datetime import datetime
 
 import re
 import json
@@ -38,8 +42,13 @@ from verl.single_controller.ray import RayResourcePool, RayWorkerGroup, RayClass
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.ppo import core_algos
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
+from verl.utils.evidence_residual import (
+    calibrate_entropy_matched_temperature,
+    select_calibration_ids,
+)
 
 import re
+from search_r1.diagnostics.opd_uncertainty import OPDUncertaintyDumper
 from search_r1.llm_agent.generation import LLMGenerationManager, GenerationConfig
 
 WorkerType = Type[Worker]
@@ -86,9 +95,76 @@ class ResourcePoolManager:
 
 import torch
 from verl.utils.torch_functional import masked_mean
+from search_r1.diagnostics.opd_uncertainty import (
+    _decode_token,
+    _ground_truth_targets,
+    _retrieval_hit,
+    infer_evidence_step_ids,
+    infer_token_segments,
+    retrieval_hits_by_information_block,
+)
 
 
-def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty='kl'):
+def compute_opd_logprob_metrics(old_log_probs: torch.Tensor,
+                                ref_log_prob: torch.Tensor,
+                                mask: torch.Tensor) -> dict:
+    logprob_gap = old_log_probs - ref_log_prob
+    divergence = masked_mean(logprob_gap.abs(), mask).item()
+    reverse_kl_k1 = masked_mean(logprob_gap, mask).item()
+    teacher_advantage = masked_mean(-logprob_gap * mask, mask).item()
+    return {
+        'opd/divergence': divergence,
+        'opd/reverse_kl_k1': reverse_kl_k1,
+        'opd/teacher_advantage': teacher_advantage,
+    }
+
+
+def _build_rce_retrieval_hit_values(evidence_step_ids, block_hits, pre_retrieval_hit: float) -> list[float]:
+    """Map decoded Search-R1 step ids to token-level retrieval-hit values."""
+    values = []
+    for step_id in evidence_step_ids:
+        if step_id == 0:
+            values.append(float(pre_retrieval_hit))
+        elif block_hits is not None and step_id - 1 < len(block_hits):
+            values.append(float(block_hits[step_id - 1]))
+        else:
+            values.append(0.0)
+    return values
+
+
+def create_dgpo_reward_mask(token_level_scores: torch.Tensor,
+                            response_length: int,
+                            reward_threshold: float = 0.1) -> torch.Tensor:
+    """Return the official DGPO mask: guide only trajectories below the reward threshold."""
+    if token_level_scores.ndim != 2:
+        raise ValueError('DGPO token_level_scores must have shape [batch, response_length]')
+    if token_level_scores.size(1) != response_length:
+        raise ValueError('DGPO reward mask must match the response length')
+
+    incorrect = (token_level_scores < reward_threshold).all(dim=1)
+    return incorrect.unsqueeze(1).expand(-1, response_length).to(token_level_scores.dtype)
+
+
+def _safe_masked_mean(x: torch.Tensor,
+                      mask: torch.Tensor,
+                      axis: int = -1,
+                      eps: float = 1e-8) -> torch.Tensor:
+    """Masked mean that maps an empty (correct-sample) DGPO mask to zero."""
+    mask = mask.to(dtype=x.dtype)
+    denominator = mask.sum(dim=axis)
+    numerator = (x * mask).sum(dim=axis)
+    return torch.where(
+        denominator > 0,
+        numerator / (denominator + eps),
+        torch.zeros_like(numerator),
+    )
+
+
+def apply_kl_penalty(data: DataProto,
+                     kl_ctrl: core_algos.AdaptiveKLController,
+                     kl_penalty='kl',
+                     dgpo_selective_kl: bool = False,
+                     dgpo_reward_threshold: float = 0.1):
     responses = data.batch['responses']
     response_length = responses.size(1)
     token_level_scores = data.batch['token_level_scores']
@@ -96,11 +172,22 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
     attention_mask = data.batch['info_mask'] if 'info_mask' in data.batch else data.batch['attention_mask']
     response_mask = attention_mask[:, -response_length:]
 
+    kl_mask = response_mask
+    dgpo_metrics = {}
+    if dgpo_selective_kl:
+        reward_mask = create_dgpo_reward_mask(
+            token_level_scores=token_level_scores,
+            response_length=response_length,
+            reward_threshold=dgpo_reward_threshold,
+        )
+        kl_mask = response_mask * reward_mask
+        dgpo_metrics['dgpo/incorrect_trajectory_fraction'] = reward_mask[:, 0].float().mean().item()
+
     # compute kl between ref_policy and current policy
     if 'ref_log_prob' in data.batch.keys():
         kld = core_algos.kl_penalty(data.batch['old_log_probs'], data.batch['ref_log_prob'],
                                     kl_penalty=kl_penalty)  # (batch_size, response_length)
-        kld = kld * response_mask
+        kld = kld * kl_mask
         beta = kl_ctrl.value
     else:
         beta = 0
@@ -108,7 +195,10 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
 
     token_level_rewards = token_level_scores - beta * kld
 
-    current_kl = masked_mean(kld, mask=response_mask, axis=-1)  # average over sequence
+    if dgpo_selective_kl:
+        current_kl = _safe_masked_mean(kld, mask=kl_mask, axis=-1)
+    else:
+        current_kl = masked_mean(kld, mask=response_mask, axis=-1)  # average over sequence
     current_kl = torch.mean(current_kl, dim=0).item()
 
     # according to https://github.com/huggingface/trl/blob/951ca1841f29114b969b57b26c7d3e80a39f75a0/trl/trainer/ppo_trainer.py#L837
@@ -116,6 +206,7 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
     data.batch['token_level_rewards'] = token_level_rewards
 
     metrics = {'critic/kl': current_kl, 'critic/kl_coeff': beta}
+    metrics.update(dgpo_metrics)
 
     return data, metrics
 
@@ -147,6 +238,134 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         advantages, returns = core_algos.compute_grpo_outcome_advantage(token_level_rewards=token_level_rewards,
                                                                         eos_mask=response_mask,
                                                                         index=index)
+        data.batch['advantages'] = advantages
+        data.batch['returns'] = returns
+    elif adv_estimator == 'opd':
+        responses = data.batch['responses']
+        response_length = responses.size(-1)
+        action_mask = data.batch['loss_mask'] if 'loss_mask' in data.batch else \
+            data.batch['attention_mask'][:, -response_length:]
+        distillation_mask = data.batch.get('opd_distillation_mask', action_mask)
+        if distillation_mask.shape != action_mask.shape:
+            raise ValueError(
+                'opd_distillation_mask must match the response action mask shape'
+            )
+        distillation_mask = (
+            distillation_mask.to(device=action_mask.device, dtype=action_mask.dtype)
+            * action_mask
+        )
+        opd_config = data.meta_info['opd_config']
+        rce_config = opd_config.get('rce', {})
+        sod_config = opd_config.get('sod', {})
+        use_rce = rce_config.get('enable', False)
+        use_sod = sod_config.get('enable', False)
+        if use_rce and use_sod:
+            raise ValueError('SOD step-wise weighting and RCE weighting are mutually exclusive')
+        if use_rce:
+            if 'ref_entropy' not in data.batch:
+                raise ValueError('RCE-OPD requires ref_entropy from the teacher/reference policy')
+            retrieval_hit = data.batch['rce_retrieval_hit'] if 'rce_retrieval_hit' in data.batch else None
+            step_ids = data.batch['rce_step_ids'] if 'rce_step_ids' in data.batch else None
+            opd_advantages, _, rce_weights = core_algos.compute_rce_opd_advantage(
+                old_log_prob=data.batch['old_log_probs'],
+                teacher_log_prob=data.batch['ref_log_prob'],
+                teacher_entropy=data.batch['ref_entropy'],
+                eos_mask=distillation_mask,
+                retrieval_hit=retrieval_hit,
+                step_ids=step_ids,
+                advantage_mode=opd_config['advantage_mode'],
+                normalize=opd_config['normalize'],
+                clip_value=opd_config['clip_value'],
+                entropy_normalization=rce_config.get('entropy_normalization', 'percentile_rank'),
+                w_min=rce_config.get('w_min', 0.1),
+                w_max=rce_config.get('w_max', 1.0),
+                alpha=rce_config.get('alpha', 4.0),
+                tau=rce_config.get('tau', 0.0),
+                default_retrieval_hit=rce_config.get('default_retrieval_hit', 0.5),
+                eps=rce_config.get('eps', 1e-8),
+                return_weights=True,
+            )
+        else:
+            opd_advantages, _ = core_algos.compute_opd_advantage(
+                old_log_prob=data.batch['old_log_probs'],
+                teacher_log_prob=data.batch['ref_log_prob'],
+                eos_mask=distillation_mask,
+                advantage_mode=opd_config['advantage_mode'],
+                normalize=opd_config['normalize'],
+                clip_value=opd_config['clip_value'],
+            )
+            rce_weights = torch.zeros_like(opd_advantages)
+
+        if use_sod:
+            if opd_config['advantage_mode'] != 'token':
+                raise ValueError('SOD requires token-mode OPD advantages')
+            if opd_config['normalize'] or opd_config['clip_value'] is not None:
+                raise ValueError('SOD requires unnormalized, unclipped OPD advantages')
+            sod_stepwise_weights, sod_step_divergence = \
+                core_algos.compute_sod_stepwise_weights(
+                    old_log_prob=data.batch['old_log_probs'],
+                    teacher_log_prob=data.batch['ref_log_prob'],
+                    step_mask=action_mask,
+                    epsilon=float(sod_config.get('epsilon', 1e-6)),
+                    delta=float(sod_config.get('delta', 0.2)),
+                )
+            sod_stepwise_weights = sod_stepwise_weights.to(opd_advantages.device)
+            sod_step_divergence = sod_step_divergence.to(opd_advantages.device)
+
+        grpo_advantages = torch.zeros_like(opd_advantages)
+        grpo_reward_coef = opd_config.get('grpo_reward_coef', 0.0)
+        distillation_coef = opd_config.get('distillation_coef', 1.0)
+        use_gated_distillation = (
+            opd_config.get('use_gated_distillation', False)
+            and grpo_reward_coef != 0
+            and not use_sod
+        )
+        if grpo_reward_coef != 0:
+            grpo_advantages, _ = core_algos.compute_grpo_outcome_advantage(
+                token_level_rewards=data.batch['token_level_rewards'],
+                eos_mask=action_mask,
+                index=data.non_tensor_batch['uid'],
+            )
+
+        if use_gated_distillation:
+            gamma = opd_config.get('gamma', 1.0)
+            beta_min = opd_config.get('beta_min', 0.0)
+            beta_max = opd_config.get('beta_max', 0.05)
+            task_advantages = masked_mean(grpo_advantages, action_mask, axis=1)
+            gate = torch.sigmoid(-gamma * task_advantages)
+            beta = beta_min + (beta_max - beta_min) * gate
+        else:
+            beta = torch.full(
+                (opd_advantages.shape[0],),
+                1.0,
+                dtype=opd_advantages.dtype,
+                device=opd_advantages.device,
+            )
+        if use_sod:
+            effective_distillation_coef = (
+                distillation_coef * sod_stepwise_weights * distillation_mask
+            )
+            weighted_opd_advantages = effective_distillation_coef * opd_advantages
+        else:
+            effective_distillation_coef = distillation_coef * beta
+            weighted_opd_advantages = (
+                effective_distillation_coef.unsqueeze(-1) * opd_advantages
+            )
+
+        advantages = weighted_opd_advantages + grpo_reward_coef * grpo_advantages
+        returns = advantages
+        data.batch['opd_advantages'] = opd_advantages
+        data.batch['opd_rce_weights'] = rce_weights
+        data.batch['opd_beta'] = beta.unsqueeze(-1) * distillation_mask
+        if use_sod:
+            data.batch['opd_effective_distillation_coef'] = effective_distillation_coef
+            data.batch['opd_sod_stepwise_weights'] = sod_stepwise_weights
+            data.batch['opd_sod_step_divergence'] = sod_step_divergence
+        else:
+            data.batch['opd_effective_distillation_coef'] = \
+                effective_distillation_coef.unsqueeze(-1) * distillation_mask
+        data.batch['weighted_opd_advantages'] = weighted_opd_advantages
+        data.batch['grpo_advantages'] = grpo_advantages
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
     else:
@@ -188,6 +407,7 @@ def compute_data_metrics(batch, use_critic=True):
 
     prompt_mask = batch.batch['attention_mask'][:, :-max_response_length].bool()
     response_mask = batch.batch['attention_mask'][:, -max_response_length:].bool()
+    advantage_mask = batch.batch['loss_mask'].bool() if 'loss_mask' in batch.batch else response_mask
 
     max_prompt_length = prompt_mask.size(-1)
 
@@ -195,12 +415,12 @@ def compute_data_metrics(batch, use_critic=True):
     prompt_length = response_info['prompt_length']
     response_length = response_info['response_length']
 
-    valid_adv = torch.masked_select(advantages, response_mask)
-    valid_returns = torch.masked_select(returns, response_mask)
+    valid_adv = torch.masked_select(advantages, advantage_mask)
+    valid_returns = torch.masked_select(returns, advantage_mask)
 
     if use_critic:
         values = batch.batch['values']
-        valid_values = torch.masked_select(values, response_mask)
+        valid_values = torch.masked_select(values, advantage_mask)
         return_diff_var = torch.var(valid_returns - valid_values)
         return_var = torch.var(valid_returns)
 
@@ -274,6 +494,17 @@ def compute_data_metrics(batch, use_critic=True):
         metrics['env/ratio_of_valid_action'] = float((np.array(batch.meta_info['valid_action_stats'], dtype=np.int16) / np.array(batch.meta_info['turns_stats'], dtype=np.int16)).mean())
     if 'valid_search_stats' in batch.meta_info:
         metrics['env/number_of_valid_search'] = float(np.array(batch.meta_info['valid_search_stats'], dtype=np.int16).mean())
+    if 'invalid_action_stats' in batch.meta_info:
+        metrics['env/number_of_invalid_action'] = float(
+            np.array(batch.meta_info['invalid_action_stats'], dtype=np.int16).mean())
+    if 'sampled_token_preservation_rate' in batch.meta_info:
+        metrics['rollout/sampled_token_preservation_rate'] = float(
+            batch.meta_info['sampled_token_preservation_rate']
+        )
+    if 'canonical_retokenization_mismatch_rate' in batch.meta_info:
+        metrics['rollout/canonical_retokenization_sequence_mismatch_rate'] = float(
+            batch.meta_info['canonical_retokenization_mismatch_rate']
+        )
 
 
     return metrics
@@ -310,6 +541,291 @@ def _timer(name: str, timing_raw: Dict[str, float]):
     timing_raw[name] = timer.last
 
 
+def validate_opd_teacher_target_config(config):
+    """Validate invariants for padded/intervened teacher-target execution."""
+    opd_config = config.algorithm.opd
+    target_mode = opd_config.get('teacher_target', 'observed')
+    supported_modes = {'observed', 'evidence_residual', 'entropy_matched'}
+    if target_mode not in supported_modes:
+        raise ValueError(f'Unsupported OPD teacher_target: {target_mode}')
+    observed_target_backend = config.actor_rollout_ref.ref.get(
+        'observed_target_backend', 'standard'
+    )
+    if target_mode == 'observed' and observed_target_backend == 'standard':
+        return
+    if target_mode == 'observed' and observed_target_backend != 'padded':
+        raise ValueError(
+            'ref.observed_target_backend must be standard or padded; '
+            f'got {observed_target_backend}'
+        )
+
+    if not config.do_search:
+        raise ValueError(f'{target_mode} requires search-agent trajectories')
+    if not config.actor_rollout_ref.actor.state_masking:
+        raise ValueError(f'{target_mode} requires state_masking=true')
+    if opd_config.advantage_mode != 'token':
+        raise ValueError(f'{target_mode} requires advantage_mode=token for equal token coverage')
+    if opd_config.normalize:
+        raise ValueError(f'{target_mode} requires normalize=false')
+    if opd_config.clip_value is not None:
+        raise ValueError(f'{target_mode} requires clip_value=null')
+    grpo_reward_coef = float(opd_config.get('grpo_reward_coef', 0.0))
+    if grpo_reward_coef < 0:
+        raise ValueError(f'{target_mode} requires grpo_reward_coef>=0')
+    if opd_config.get('rce', {}).get('enable', False):
+        raise ValueError(f'{target_mode} requires all RCE/token-weighting paths to be disabled')
+    if config.actor_rollout_ref.actor.entropy_coeff != 0:
+        raise ValueError(f'{target_mode} requires actor entropy_coeff=0')
+    if config.actor_rollout_ref.actor.ppo_epochs != 1:
+        raise ValueError(f'{target_mode} requires ppo_epochs=1')
+    rollout_group_size = (
+        config.actor_rollout_ref.rollout.n
+        * config.actor_rollout_ref.rollout.n_agent
+    )
+    if grpo_reward_coef > 0:
+        if rollout_group_size <= 1:
+            raise ValueError(
+                f'{target_mode}+GRPO requires more than one rollout per question'
+            )
+    else:
+        if rollout_group_size != 1:
+            raise ValueError(
+                f'pure {target_mode} requires exactly one on-policy trajectory per question'
+            )
+        if config.actor_rollout_ref.actor.ppo_mini_batch_size != config.data.train_batch_size:
+            raise ValueError(
+                f'pure {target_mode} requires ppo_mini_batch_size=train_batch_size so the update '
+                'is one global mean over all policy tokens'
+            )
+    if config.actor_rollout_ref.rollout.temperature != 1.0:
+        raise ValueError(f'{target_mode} requires rollout.temperature=1.0 so teacher logits are unscaled')
+    if not config.actor_rollout_ref.rollout.get('restrict_to_tokenizer_vocab', False):
+        raise ValueError(f'{target_mode} requires rollout.restrict_to_tokenizer_vocab=true')
+    if config.actor_rollout_ref.ref.attn_implementation != 'sdpa':
+        raise ValueError(f'{target_mode} requires ref.attn_implementation=sdpa')
+    if config.actor_rollout_ref.ref.ulysses_sequence_parallel_size != 1:
+        raise ValueError(f'{target_mode} requires ref.ulysses_sequence_parallel_size=1')
+    fp32_aliases = {'32', 'fp32', 'float32'}
+    fp16_aliases = {'16', 'fp16', 'float16'}
+    bf16_aliases = {'bf16', 'bfloat16'}
+    ref_fsdp_config = config.actor_rollout_ref.ref.fsdp_config
+    precision_settings = {
+        'ref.fsdp_config.model_dtype': str(ref_fsdp_config.get('model_dtype')).lower(),
+        'ref.fsdp_config.mixed_precision.param_dtype': str(
+            ref_fsdp_config.mixed_precision.param_dtype
+        ).lower(),
+        'ref.target_forward_dtype': str(
+            config.actor_rollout_ref.ref.get('target_forward_dtype')
+        ).lower(),
+    }
+    allow_approximate_precision = bool(
+        config.actor_rollout_ref.ref.get('allow_approximate_target_precision', False)
+    )
+    if allow_approximate_precision:
+        precision_family = None
+        for aliases in (fp16_aliases, bf16_aliases):
+            if all(value in aliases for value in precision_settings.values()):
+                precision_family = aliases
+                break
+        if precision_family is None:
+            raise ValueError(
+                f'{target_mode} approximate teacher precision requires model, mixed-precision, '
+                f'and forward dtypes to consistently use FP16 or BF16; got {precision_settings}'
+            )
+    else:
+        for name, value in precision_settings.items():
+            if value not in fp32_aliases:
+                raise ValueError(
+                    f'{target_mode} requires {name}=fp32 unless '
+                    'ref.allow_approximate_target_precision=true'
+                )
+    lambda_distill = opd_config.get('lambda_distill')
+    if lambda_distill is None or lambda_distill <= 0:
+        raise ValueError(f'{target_mode} requires a positive fixed lambda_distill')
+    if opd_config.get('target_token_chunk_size', 0) <= 0:
+        raise ValueError('target_token_chunk_size must be positive')
+    if target_mode == 'evidence_residual':
+        try:
+            evidence_residual_alpha = float(
+                opd_config.get('evidence_residual_alpha', 1.0)
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                'evidence_residual_alpha must be finite and non-negative'
+            ) from exc
+        if not math.isfinite(evidence_residual_alpha) or evidence_residual_alpha < 0:
+            raise ValueError('evidence_residual_alpha must be finite and non-negative')
+    if target_mode == 'entropy_matched':
+        tau = opd_config.get('entropy_matched_tau')
+        if tau is None or tau <= 0:
+            raise ValueError('entropy_matched requires a positive pre-calibrated entropy_matched_tau')
+
+
+def validate_sod_config(config):
+    """Reject configurations that no longer represent the released SOD baseline."""
+    opd_config = config.algorithm.opd
+    sod_config = opd_config.get('sod', {})
+    if not sod_config.get('enable', False):
+        return
+
+    if opd_config.get('teacher_target', 'observed') != 'observed':
+        raise ValueError('SOD requires the ordinary observed teacher target')
+    if config.actor_rollout_ref.ref.get('observed_target_backend', 'standard') != 'padded':
+        raise ValueError(
+            'SOD requires ref.observed_target_backend=padded so SDPA preserves '
+            'micro-batch attention boundaries'
+        )
+    if not config.do_search:
+        raise ValueError('SOD requires multi-step search-agent trajectories')
+    if not config.actor_rollout_ref.actor.state_masking:
+        raise ValueError('SOD requires state_masking=true so observations delimit assistant steps')
+    if opd_config.advantage_mode != 'token':
+        raise ValueError('SOD requires advantage_mode=token')
+    if opd_config.normalize:
+        raise ValueError('SOD requires normalize=false')
+    if opd_config.clip_value is not None:
+        raise ValueError('SOD requires clip_value=null')
+    if float(opd_config.get('grpo_reward_coef', 0.0)) <= 0:
+        raise ValueError('the released SOD baseline requires a positive GRPO reward coefficient')
+    if opd_config.get('use_gated_distillation', False):
+        raise ValueError('SOD step-wise weighting replaces the legacy sigmoid gate')
+    if opd_config.get('rce', {}).get('enable', False):
+        raise ValueError('SOD and RCE weighting cannot be enabled together')
+    if opd_config.get('mask_protocol_tags', False):
+        raise ValueError('SOD requires all assistant tokens when measuring step divergence')
+    if config.actor_rollout_ref.actor.entropy_coeff != 0:
+        raise ValueError('SOD requires actor entropy_coeff=0')
+    if config.actor_rollout_ref.actor.ppo_epochs != 1:
+        raise ValueError('SOD requires one PPO epoch per rollout batch')
+
+    epsilon = float(sod_config.get('epsilon', 1e-6))
+    delta = float(sod_config.get('delta', 0.2))
+    if epsilon <= 0:
+        raise ValueError('SOD epsilon must be positive')
+    if delta < 0:
+        raise ValueError('SOD delta must be non-negative')
+    lambda_distill = opd_config.get('lambda_distill')
+    if lambda_distill is None:
+        lambda_distill = opd_config.get('distillation_coef', 1.0)
+    if float(lambda_distill) <= 0:
+        raise ValueError('SOD requires a positive distillation coefficient')
+
+
+def compute_tcod_f2b_turns(global_step, max_turns, checkpoint_steps, start_turns=1):
+    """Return TCOD-F2B's training horizon for a one-indexed trainer step.
+
+    The official curriculum is ``k = k_start + floor(n / eta)``. Search-R1's
+    trainer reports steps from one, so ``n`` is represented by
+    ``global_step - 1`` here. The result is capped at the evaluation horizon.
+    """
+    if global_step < 1:
+        raise ValueError('TCOD global_step must be one-indexed and positive')
+    if max_turns < 1:
+        raise ValueError('TCOD max_turns must be positive')
+    if checkpoint_steps < 1:
+        raise ValueError('TCOD checkpoint_steps must be positive')
+    if start_turns < 1 or start_turns > max_turns:
+        raise ValueError('TCOD start_turns must be in [1, max_turns]')
+    return min(
+        start_turns + ((global_step - 1) // checkpoint_steps),
+        max_turns,
+    )
+
+
+def validate_tcod_config(config):
+    """Reject settings that deviate from the official TCOD-F2B objective."""
+    opd_config = config.algorithm.opd
+    tcod_config = opd_config.get('tcod', {})
+    if not tcod_config.get('enable', False):
+        return
+
+    if str(tcod_config.get('variant', 'f2b')).lower() != 'f2b':
+        raise ValueError(
+            'this Search-R1 migration supports official TCOD-F2B only; '
+            'TCOD-B2F requires replayable successful teacher trajectories'
+        )
+    if opd_config.get('teacher_target', 'observed') != 'observed':
+        raise ValueError('TCOD requires the ordinary observed teacher target')
+    if not config.do_search:
+        raise ValueError('TCOD requires multi-turn search-agent trajectories')
+    if not config.actor_rollout_ref.actor.state_masking:
+        raise ValueError('TCOD requires state_masking=true for multi-turn OPD')
+    if opd_config.advantage_mode != 'token':
+        raise ValueError('TCOD requires advantage_mode=token')
+    if opd_config.normalize:
+        raise ValueError('TCOD requires normalize=false')
+    if opd_config.clip_value is not None:
+        raise ValueError('TCOD requires clip_value=null')
+    if float(opd_config.get('grpo_reward_coef', 0.0)) != 0.0:
+        raise ValueError('official TCOD uses pure OPD, so grpo_reward_coef must be zero')
+    if opd_config.get('use_gated_distillation', False):
+        raise ValueError('official TCOD does not use the legacy sigmoid distillation gate')
+    if opd_config.get('rce', {}).get('enable', False):
+        raise ValueError('TCOD and RCE weighting cannot be enabled together')
+    if opd_config.get('sod', {}).get('enable', False):
+        raise ValueError('TCOD and SOD cannot be enabled together')
+    if opd_config.get('mask_protocol_tags', False):
+        raise ValueError('TCOD requires distillation over all assistant tokens')
+    if config.actor_rollout_ref.actor.entropy_coeff != 0:
+        raise ValueError('TCOD requires actor entropy_coeff=0')
+    if config.actor_rollout_ref.actor.ppo_epochs != 1:
+        raise ValueError('TCOD requires one policy epoch per rollout batch')
+    if config.actor_rollout_ref.rollout.n != 1:
+        raise ValueError('TCOD requires rollout.n=1')
+    if config.actor_rollout_ref.rollout.n_agent != 1:
+        raise ValueError('official pure-OPD TCOD requires rollout.n_agent=1')
+
+    lambda_distill = opd_config.get('lambda_distill')
+    if lambda_distill is None:
+        lambda_distill = opd_config.get('distillation_coef', 1.0)
+    if float(lambda_distill) <= 0:
+        raise ValueError('TCOD requires a positive distillation coefficient')
+
+    compute_tcod_f2b_turns(
+        global_step=1,
+        max_turns=int(config.max_turns),
+        checkpoint_steps=int(tcod_config.get('checkpoint_steps', 25)),
+        start_turns=int(tcod_config.get('start_turns', 1)),
+    )
+
+
+def validate_dgpo_config(config):
+    """Validate DGPO selective-teacher-guidance settings."""
+    dgpo_config = config.algorithm.get('dgpo', {})
+    if not dgpo_config.get('enable', False):
+        return
+
+    if config.algorithm.adv_estimator not in {'gae', 'grpo'}:
+        raise ValueError('DGPO selective teacher guidance supports gae or grpo advantages')
+    if config.actor_rollout_ref.actor.strategy != 'fsdp':
+        raise ValueError('DGPO with an independent teacher currently supports FSDP only')
+    if not config.actor_rollout_ref.ref.get('model_path'):
+        raise ValueError('DGPO requires actor_rollout_ref.ref.model_path to be the teacher checkpoint')
+    if config.actor_rollout_ref.actor.use_kl_loss:
+        raise ValueError('DGPO applies selective reward-side KL; actor.use_kl_loss must be false')
+    if config.algorithm.kl_penalty != 'kl':
+        raise ValueError('official DGPO uses the forward KL estimator algorithm.kl_penalty=kl')
+    if config.algorithm.kl_ctrl.type != 'fixed':
+        raise ValueError('official DGPO uses a fixed teacher KL coefficient')
+    if float(config.algorithm.kl_ctrl.kl_coef) < 0:
+        raise ValueError('DGPO teacher KL coefficient must be non-negative')
+    if config.do_search and not config.actor_rollout_ref.actor.state_masking:
+        raise ValueError('DGPO search training requires state_masking=true for retrieved tokens')
+    if config.actor_rollout_ref.rollout.n != 1:
+        raise ValueError('DGPO uses rollout.n=1; set group multiplicity with rollout.n_agent')
+    if config.actor_rollout_ref.rollout.n_agent < 1:
+        raise ValueError('DGPO rollout.n_agent must be positive')
+    if (
+        config.algorithm.adv_estimator == 'grpo'
+        and config.actor_rollout_ref.rollout.n_agent < 2
+    ):
+        raise ValueError('DGPO+GRPO requires at least two trajectories per prompt')
+
+    reward_threshold = float(dgpo_config.get('reward_threshold', 0.1))
+    if not np.isfinite(reward_threshold) or reward_threshold <= 0:
+        raise ValueError('DGPO reward_threshold must be finite and positive')
+
+
 class RayPPOTrainer(object):
     """
     Note that this trainer runs on the driver process on a single CPU/GPU node.
@@ -342,8 +858,34 @@ class RayPPOTrainer(object):
         self.role_worker_mapping = role_worker_mapping
         self.resource_pool_manager = resource_pool_manager
         self.use_reference_policy = Role.RefPolicy in role_worker_mapping
-        self.use_rm = Role.RewardModel in role_worker_mapping
+        self.use_opd = config.algorithm.adv_estimator == 'opd'
+        self.use_dgpo = bool(config.algorithm.get('dgpo', {}).get('enable', False))
+        self.use_rm = Role.RewardModel in role_worker_mapping and not self.use_opd
         self.ray_worker_group_cls = ray_worker_group_cls
+        self.opd_diagnostics = None
+
+        if self.use_opd and not self.config.trainer.get('val_only', False):
+            assert self.use_reference_policy, 'OPD requires a teacher/reference policy'
+            assert not config.actor_rollout_ref.actor.use_kl_loss, \
+                'OPD uses the teacher signal directly; actor.use_kl_loss must be false'
+            assert not config.do_search or config.actor_rollout_ref.actor.state_masking, \
+                'Search OPD requires actor.state_masking=true to exclude observation tokens'
+            validate_opd_teacher_target_config(config)
+            validate_sod_config(config)
+            validate_tcod_config(config)
+            if config.algorithm.opd.grpo_reward_coef != 0:
+                group_size = config.actor_rollout_ref.rollout.n_agent * config.actor_rollout_ref.rollout.n
+                assert group_size > 1, 'OPD + GRPO reward requires more than one rollout per prompt'
+            if config.algorithm.opd.get('diagnostics', {}).get('enable', False):
+                self.opd_diagnostics = OPDUncertaintyDumper(
+                    tokenizer=self.tokenizer,
+                    trainer_config=config.trainer,
+                    opd_config=config.algorithm.opd,
+                )
+
+        if self.use_dgpo and not self.config.trainer.get('val_only', False):
+            assert self.use_reference_policy, 'DGPO requires a teacher/reference policy'
+            validate_dgpo_config(config)
 
         # define KL control
         if self.use_reference_policy:
@@ -380,6 +922,15 @@ class RayPPOTrainer(object):
                                          filter_prompts=True,
                                          return_raw_chat=self.config.data.get('return_raw_chat', False),
                                          truncation='error')
+        train_data_source = self.config.data.get('train_data_source')
+        if train_data_source:
+            if 'data_source' not in self.train_dataset.dataframe.columns:
+                raise ValueError('data.train_data_source requires a data_source parquet column')
+            self.train_dataset.dataframe = self.train_dataset.dataframe[
+                self.train_dataset.dataframe['data_source'] == train_data_source
+            ].copy()
+            if self.train_dataset.dataframe.empty:
+                raise ValueError(f'no training rows found for data_source={train_data_source!r}')
         if self.config.data.train_data_num is not None:
             if self.config.data.train_data_num > len(self.train_dataset.dataframe):
                 print(f"[WARNING] training dataset size is smaller than desired size. Using the dataset as the original size {len(self.train_dataset.dataframe)}")
@@ -400,6 +951,15 @@ class RayPPOTrainer(object):
                                        filter_prompts=True,
                                        return_raw_chat=self.config.data.get('return_raw_chat', False),
                                        truncation='error')
+        val_data_source = self.config.data.get('val_data_source')
+        if val_data_source:
+            if 'data_source' not in self.val_dataset.dataframe.columns:
+                raise ValueError('data.val_data_source requires a data_source parquet column')
+            self.val_dataset.dataframe = self.val_dataset.dataframe[
+                self.val_dataset.dataframe['data_source'] == val_data_source
+            ].copy()
+            if self.val_dataset.dataframe.empty:
+                raise ValueError(f'no validation rows found for data_source={val_data_source!r}')
         if self.config.data.val_data_num is not None:
             if self.config.data.val_data_num > len(self.val_dataset.dataframe):
                 print(f"[WARNING] validation dataset size is smaller than desired size. Using the dataset as the original size {len(self.val_dataset.dataframe)}")
@@ -410,7 +970,7 @@ class RayPPOTrainer(object):
         self.val_dataloader = DataLoader(dataset=self.val_dataset,
                                          batch_size=self.config.data.val_batch_size,
                                          shuffle=False,
-                                         drop_last=True,
+                                         drop_last=False,
                                          collate_fn=collate_fn)
 
         print(f'Size of train dataloader: {len(self.train_dataloader)}')
@@ -439,8 +999,14 @@ class RayPPOTrainer(object):
         Accumulates metrics across all batches before computing final statistics.
         """
         import torch
+        import time
         reward_tensor_lst = []
         data_source_lst = []
+        total_val_steps = len(self.val_dataloader)
+        print(f'[validation] total batches: {total_val_steps}')
+        val_do_sample = bool(
+            self.config.actor_rollout_ref.rollout.get('val_do_sample', False)
+        )
 
         gen_config = GenerationConfig(
             max_turns=self.config.max_turns,
@@ -463,7 +1029,9 @@ class RayPPOTrainer(object):
         )
 
         if not self.config.do_search:
-            for test_data in self.val_dataloader:
+            for val_step, test_data in enumerate(self.val_dataloader, start=1):
+                batch_start_time = time.perf_counter()
+                print(f'[validation] running batch {val_step}/{total_val_steps}')
                 test_batch = DataProto.from_single_dict(test_data)
 
                 # we only do validation on rule-based rm
@@ -475,7 +1043,7 @@ class RayPPOTrainer(object):
                     'eos_token_id': self.tokenizer.eos_token_id,
                     'pad_token_id': self.tokenizer.pad_token_id,
                     'recompute_log_prob': False,
-                    'do_sample': False,
+                    'do_sample': val_do_sample,
                     'validate': True,
                 }
 
@@ -494,8 +1062,12 @@ class RayPPOTrainer(object):
 
                 reward_tensor_lst.append(reward_tensor)
                 data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
+                elapsed = time.perf_counter() - batch_start_time
+                print(f'[validation] completed batch {val_step}/{total_val_steps} elapsed_s={elapsed:.3f}')
         else:
-            for batch_dict in self.val_dataloader:
+            for val_step, batch_dict in enumerate(self.val_dataloader, start=1):
+                batch_start_time = time.perf_counter()
+                print(f'[validation] running batch {val_step}/{total_val_steps}')
                 timing_raw = {}
                 test_batch: DataProto = DataProto.from_single_dict(batch_dict)
                 # test_batch = test_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n_agent, interleave=True)
@@ -505,7 +1077,7 @@ class RayPPOTrainer(object):
                     'eos_token_id': self.tokenizer.eos_token_id,
                     'pad_token_id': self.tokenizer.pad_token_id,
                     'recompute_log_prob': False,
-                    'do_sample': False,
+                    'do_sample': val_do_sample,
                     'validate': True,
                 }
                 with _timer('step', timing_raw):
@@ -528,6 +1100,11 @@ class RayPPOTrainer(object):
 
                     reward_tensor_lst.append(reward_tensor)
                     data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
+                    elapsed = time.perf_counter() - batch_start_time
+                    print(
+                        f'[validation] completed batch {val_step}/{total_val_steps} '
+                        f'elapsed_s={elapsed:.3f}'
+                    )
 
         reward_tensor = torch.cat([rw.sum(-1) for rw in reward_tensor_lst], dim=0).cpu()  # (batch_size,)
         # reward_tensor = torch.cat(reward_tensor_lst, dim=0).sum(-1).cpu()  # (batch_size,)
@@ -543,6 +1120,23 @@ class RayPPOTrainer(object):
         metric_dict = {}
         for data_source, rewards in data_source_reward.items():
             metric_dict[f'val/test_score/{data_source}'] = np.mean(rewards)
+
+        avg_data_sources = [
+            'nq',
+            'triviaqa',
+            'popqa',
+            'hotpotqa',
+            '2wikimultihopqa',
+            'musique',
+            'bamboogle',
+        ]
+        avg_scores = [
+            metric_dict[f'val/test_score/{data_source}']
+            for data_source in avg_data_sources
+            if f'val/test_score/{data_source}' in metric_dict
+        ]
+        if len(avg_scores) == len(avg_data_sources):
+            metric_dict['val/test_score/Avg'] = np.mean(avg_scores)
 
         return metric_dict
 
@@ -570,7 +1164,7 @@ class RayPPOTrainer(object):
             self.resource_pool_to_cls[resource_pool]['critic'] = critic_cls
             self.use_critic = True
             
-        elif self.config.algorithm.adv_estimator == 'grpo':
+        elif self.config.algorithm.adv_estimator in ['grpo', 'opd']:
             self.use_critic = False
         else:
             raise NotImplementedError
@@ -634,6 +1228,198 @@ class RayPPOTrainer(object):
                 self.config.trainer.default_hdfs_dir, 'critic')
             self.critic_wg.save_checkpoint(critic_local_path, critic_remote_path)
 
+    def _score_calibration_entropy(self, calibration_batches, target_mode, tau=None):
+        entropy_sum = 0.0
+        observed_entropy_sum = 0.0
+        token_count = 0
+        for calibration_batch, pad_size in calibration_batches:
+            calibration_batch.meta_info['opd_teacher_target'] = target_mode
+            calibration_batch.meta_info['opd_entropy_matched_tau'] = tau
+            calibration_batch.meta_info['opd_target_token_chunk_size'] = \
+                self.config.algorithm.opd.get('target_token_chunk_size', 16)
+            calibration_batch.meta_info['opd_evidence_residual_alpha'] = \
+                self.config.algorithm.opd.get('evidence_residual_alpha', 1.0)
+            output = self.ref_policy_wg.compute_ref_log_prob(calibration_batch)
+            valid_output = unpad_dataproto(output, pad_size)
+            valid_batch = unpad_dataproto(calibration_batch, pad_size)
+            policy_mask = valid_batch.batch['loss_mask'].float()
+            entropy_sum += (valid_output.batch['ref_entropy'] * policy_mask).sum().item()
+            if 'ref_observed_entropy' in valid_output.batch:
+                observed_entropy_sum += (
+                    valid_output.batch['ref_observed_entropy'] * policy_mask
+                ).sum().item()
+            token_count += int(policy_mask.sum().item())
+        if token_count == 0:
+            raise ValueError('entropy calibration collected no policy-token rows')
+        return {
+            'mean_entropy': entropy_sum / token_count,
+            'mean_observed_entropy': observed_entropy_sum / token_count,
+            'token_count': token_count,
+        }
+
+    def _run_er_entropy_calibration(self, generation_manager):
+        """Collect frozen-student rows once and fit one auditable global tau."""
+        from torch.utils.data import DataLoader
+        from verl.utils.dataset.rl_dataset import collate_fn
+
+        calibration_config = self.config.trainer.er_entropy_calibration
+        if self.config.algorithm.opd.teacher_target != 'evidence_residual':
+            raise ValueError('ER entropy calibration must run with teacher_target=evidence_residual')
+        if self.config.actor_rollout_ref.rollout.seed != calibration_config.decode_seed:
+            raise ValueError('rollout.seed must equal er_entropy_calibration.decode_seed')
+
+        dataframe = self.train_dataset.dataframe
+        data_source = calibration_config.get('data_source')
+        if data_source:
+            dataframe = dataframe[dataframe['data_source'] == data_source]
+        if dataframe.empty:
+            raise ValueError(f'no training questions found for calibration data_source={data_source!r}')
+        if 'id' not in dataframe.columns:
+            raise ValueError('entropy calibration requires a stable question id column')
+
+        selected_ids = select_calibration_ids(
+            dataframe['id'].astype(str).tolist(),
+            seed=calibration_config.split_seed,
+            fraction=calibration_config.fraction,
+        )
+        selection_order = {question_id: idx for idx, question_id in enumerate(selected_ids)}
+        selected_dataframe = dataframe[
+            dataframe['id'].astype(str).isin(selection_order)
+        ].copy()
+        selected_dataframe['_calibration_order'] = selected_dataframe['id'].astype(str).map(selection_order)
+        selected_dataframe = selected_dataframe.sort_values('_calibration_order').drop(
+            columns=['_calibration_order'])
+
+        calibration_dataset = copy.copy(self.train_dataset)
+        calibration_dataset.dataframe = selected_dataframe
+        calibration_loader = DataLoader(
+            dataset=calibration_dataset,
+            batch_size=self.config.data.train_batch_size,
+            shuffle=False,
+            drop_last=False,
+            collate_fn=collate_fn,
+        )
+
+        calibration_batches = []
+        trajectory_count = 0
+        for batch_dict in calibration_loader:
+            batch = DataProto.from_single_dict(batch_dict)
+            trajectory_count += len(batch)
+            batch.non_tensor_batch['uid'] = np.array(
+                [str(uuid.uuid4()) for _ in range(len(batch))],
+                dtype=object,
+            )
+            gen_batch = batch.pop(batch_keys=['input_ids', 'attention_mask', 'position_ids'])
+            first_input_ids = gen_batch.batch['input_ids'][
+                :, -self.config.data.max_start_length:
+            ].clone().long()
+            final_output = generation_manager.run_llm_loop(
+                gen_batch=gen_batch,
+                initial_input_ids=first_input_ids,
+            )
+            for key in final_output.batch.keys():
+                final_output.batch[key] = final_output.batch[key].long()
+            batch = batch.union(final_output)
+            batch, _ = self._create_loss_mask(batch, {})
+            scoring_batch = DataProto.from_dict(tensors={
+                key: batch.batch[key]
+                for key in (
+                    'responses',
+                    'input_ids',
+                    'attention_mask',
+                    'position_ids',
+                    'evidence_mask',
+                    'loss_mask',
+                )
+            })
+            scoring_batch, pad_size = pad_dataproto_to_divisor(
+                scoring_batch,
+                self.ref_policy_wg.world_size,
+            )
+            calibration_batches.append((scoring_batch, pad_size))
+
+        er_stats = self._score_calibration_entropy(
+            calibration_batches,
+            target_mode='evidence_residual',
+        )
+
+        def mean_visible_entropy(temperature):
+            return self._score_calibration_entropy(
+                calibration_batches,
+                target_mode='entropy_matched',
+                tau=temperature,
+            )['mean_entropy']
+
+        result = calibrate_entropy_matched_temperature(
+            mean_visible_entropy,
+            target_entropy=er_stats['mean_entropy'],
+            entropy_tolerance=calibration_config.entropy_tolerance,
+            relative_temperature_tolerance=calibration_config.relative_temperature_tolerance,
+        )
+        fingerprint_payload = {
+            'selected_question_ids': selected_ids,
+            'split_seed': int(calibration_config.split_seed),
+            'decode_seed': int(calibration_config.decode_seed),
+            'student_model': str(self.config.actor_rollout_ref.model.path),
+            'teacher_model': str(self.config.actor_rollout_ref.ref.model_path),
+            'shared_vocab_size': len(self.tokenizer),
+            'evidence_residual_alpha': float(
+                self.config.algorithm.opd.get('evidence_residual_alpha', 1.0)
+            ),
+        }
+        calibration_fingerprint = hashlib.sha256(
+            json.dumps(
+                fingerprint_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(',', ':'),
+            ).encode('utf-8')
+        ).hexdigest()
+        artifact = {
+            'schema_version': 1,
+            'created_at': datetime.now().astimezone().isoformat(),
+            'method': 'ER-OPD entropy-matched control calibration',
+            'student_model': str(self.config.actor_rollout_ref.model.path),
+            'teacher_model': str(self.config.actor_rollout_ref.ref.model_path),
+            'shared_vocab_size': len(self.tokenizer),
+            'evidence_residual_alpha': float(
+                self.config.algorithm.opd.get('evidence_residual_alpha', 1.0)
+            ),
+            'data_source': data_source,
+            'fraction': float(calibration_config.fraction),
+            'split_seed': int(calibration_config.split_seed),
+            'decode_seed': int(calibration_config.decode_seed),
+            'selection_rule': 'seeded crc32 rank of question ids with lexical tie-break',
+            'calibration_fingerprint_sha256': calibration_fingerprint,
+            'selected_question_ids': selected_ids,
+            'selected_question_count': len(selected_ids),
+            'trajectory_count': trajectory_count,
+            'policy_token_count': er_stats['token_count'],
+            'er_mean_entropy': er_stats['mean_entropy'],
+            'visible_mean_entropy_at_tau_1': er_stats['mean_observed_entropy'],
+            'temperature': result.temperature,
+            'matched_mean_entropy': result.achieved_entropy,
+            'entropy_gap': result.entropy_gap,
+            'entropy_tolerance': float(calibration_config.entropy_tolerance),
+            'relative_temperature_tolerance': float(
+                calibration_config.relative_temperature_tolerance),
+            'solver_evaluations': result.evaluations,
+            'stop_reason': result.stop_reason,
+        }
+
+        output_path = os.path.abspath(os.path.expanduser(calibration_config.output_path))
+        output_dir = os.path.dirname(output_path)
+        os.makedirs(output_dir, exist_ok=True)
+        stem, extension = os.path.splitext(output_path)
+        timestamped_path = f"{stem}_{datetime.now().strftime('%Y%m%d_%H%M%S')}{extension}"
+        for path in (timestamped_path, output_path):
+            with open(path, 'w', encoding='utf-8') as output_file:
+                json.dump(artifact, output_file, ensure_ascii=False, indent=2)
+                output_file.write('\n')
+        print(f'ER entropy calibration saved: {timestamped_path}')
+        print(f'Use ENTROPY_MATCHED_TAU={result.temperature:.12g}')
+        return artifact
+
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix='global_seqlen'):
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
         attention_mask = batch.batch['attention_mask']
@@ -651,6 +1437,75 @@ class RayPPOTrainer(object):
                                                     prefix=logging_prefix)
         metrics.update(global_balance_stats)
 
+    def _create_rce_metadata(self, batch: DataProto, metrics: dict):
+        """Create token-aligned RCE metadata from decoded Search-R1 trajectories."""
+        response_length = batch.batch['responses'].size(-1)
+        response_mask = batch.batch['attention_mask'][:, -response_length:]
+        rce_config = self.config.algorithm.opd.get('rce', {})
+        pre_retrieval_hit = float(rce_config.get('default_retrieval_hit', 0.5))
+
+        step_ids = torch.full_like(batch.batch['responses'], -1, dtype=torch.long)
+        retrieval_hit = torch.zeros_like(batch.batch['responses'], dtype=torch.float32)
+        sequence_retrieval_hit = torch.full(
+            (batch.batch['responses'].shape[0],),
+            0.0,
+            dtype=torch.float32,
+        )
+        retrieval_hit_known = torch.zeros_like(sequence_retrieval_hit, dtype=torch.bool)
+        reward_models = batch.non_tensor_batch.get("reward_model", [None] * len(batch))
+
+        for seq_idx in range(len(batch)):
+            valid_len = int(response_mask[seq_idx].sum().item())
+            response_ids = batch.batch["responses"][seq_idx, :valid_len].detach().cpu().tolist()
+            token_texts = [_decode_token(self.tokenizer, int(token_id)) for token_id in response_ids]
+            evidence_step_ids = infer_evidence_step_ids(token_texts)
+            if evidence_step_ids:
+                step_ids[seq_idx, :valid_len] = torch.tensor(
+                    evidence_step_ids,
+                    dtype=torch.long,
+                    device=step_ids.device,
+                )
+
+            targets = _ground_truth_targets(reward_models[seq_idx])
+            decoded_response = "".join(token_texts)
+            sequence_hit = _retrieval_hit(decoded_response, targets)
+            block_hits = retrieval_hits_by_information_block(decoded_response, targets)
+            if evidence_step_ids:
+                hit_values = _build_rce_retrieval_hit_values(
+                    evidence_step_ids,
+                    block_hits,
+                    pre_retrieval_hit,
+                )
+                retrieval_hit[seq_idx, :valid_len] = torch.tensor(
+                    hit_values,
+                    dtype=torch.float32,
+                    device=retrieval_hit.device,
+                )
+            if sequence_hit is not None:
+                sequence_retrieval_hit[seq_idx] = float(sequence_hit)
+                retrieval_hit_known[seq_idx] = True
+
+        batch.batch['rce_step_ids'] = step_ids
+        batch.batch['rce_retrieval_hit'] = retrieval_hit
+
+        known_count = retrieval_hit_known.sum().item()
+        if known_count > 0:
+            metrics['opd/rce_retrieval_hit_proxy'] = sequence_retrieval_hit[retrieval_hit_known].mean().item()
+            metrics['opd/rce_retrieval_hit_known'] = float(known_count)
+        step_counts = []
+        for seq_idx in range(len(batch)):
+            valid_steps = step_ids[seq_idx][response_mask[seq_idx].bool() & (step_ids[seq_idx] >= 0)]
+            step_counts.append(float(torch.unique(valid_steps).numel()) if valid_steps.numel() > 0 else 0.0)
+        metrics['opd/rce_step_count_mean'] = float(np.mean(step_counts)) if step_counts else 0.0
+
+        return batch, metrics
+
+    @staticmethod
+    def _plain_config(config):
+        if OmegaConf.is_config(config):
+            return OmegaConf.to_container(config, resolve=True)
+        return dict(config) if isinstance(config, dict) else {}
+
     def fit(self):
         """
         The training loop of PPO.
@@ -659,7 +1514,11 @@ class RayPPOTrainer(object):
         """
 
         logger = self.logger
-        self.global_steps = 0
+        # Weight-only continuation: this offsets logging/checkpoint steps, but
+        # deliberately does not claim to restore optimizer or dataloader state.
+        self.global_steps = int(self.config.trainer.get('warm_start_step', 0))
+        if self.global_steps < 0 or (self.global_steps and self.global_steps >= self.total_training_steps - 1):
+            raise ValueError('warm_start_step must leave at least one training update')
         # perform validation before training
         # currently, we only support validation using the reward_function.
         if self.val_reward_fn is not None and self.config.trainer.get('val_before_train', True):
@@ -691,6 +1550,10 @@ class RayPPOTrainer(object):
             config=gen_config,
         )
 
+        if self.config.trainer.er_entropy_calibration.get('enable', False):
+            self._run_er_entropy_calibration(generation_manager)
+            return
+
         # start training loop
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
@@ -698,7 +1561,32 @@ class RayPPOTrainer(object):
                 metrics = {}
                 timing_raw = {}
 
+                tcod_config = self.config.algorithm.opd.get('tcod', {})
+                if tcod_config.get('enable', False):
+                    curriculum_turns = compute_tcod_f2b_turns(
+                        global_step=self.global_steps,
+                        max_turns=int(self.config.max_turns),
+                        checkpoint_steps=int(tcod_config.get('checkpoint_steps', 25)),
+                        start_turns=int(tcod_config.get('start_turns', 1)),
+                    )
+                    generation_manager.config.max_turns = curriculum_turns
+                    metrics.update({
+                        'tcod/curriculum_turns': float(curriculum_turns),
+                        'tcod/full_horizon': float(curriculum_turns == self.config.max_turns),
+                    })
+                    print(
+                        f'[TCOD-F2B] step={self.global_steps} '
+                        f'train_max_turns={curriculum_turns}/{self.config.max_turns}'
+                    )
+
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
+                if self.config.do_search:
+                    # Keep all rollouts from the same prompt in one GRPO group.
+                    # Dataset indices are not globally unique across merged sources.
+                    batch.non_tensor_batch['uid'] = np.array(
+                        [str(uuid.uuid4()) for _ in range(len(batch.batch))],
+                        dtype=object,
+                    )
                 batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n_agent, interleave=True)
 
                 # pop those keys for generation
@@ -736,13 +1624,14 @@ class RayPPOTrainer(object):
                             final_gen_batch_output.batch[key] = final_gen_batch_output.batch[key].long()
 
                         with torch.no_grad():
+                            if self.use_opd or (
+                                self.opd_diagnostics is not None
+                                and self.opd_diagnostics.should_dump(self.global_steps)
+                            ):
+                                final_gen_batch_output.meta_info['return_entropy'] = True
                             output = self.actor_rollout_wg.compute_log_prob(final_gen_batch_output)
                             final_gen_batch_output = final_gen_batch_output.union(output)
 
-                        # batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
-                        #                                         dtype=object)
-                        batch.non_tensor_batch['uid'] = batch.non_tensor_batch['index'].copy()
-                                            
                         # repeat to align with repeated responses in rollout
                         batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                         batch = batch.union(final_gen_batch_output)
@@ -759,13 +1648,40 @@ class RayPPOTrainer(object):
                     batch.meta_info['global_token_num'] = torch.sum(batch.batch['attention_mask'], dim=-1).tolist()
 
                     # batch.batch.apply(lambda x, key: x.long() if key != "old_log_probs" else x, inplace=True, key=True)
+                    float_batch_keys = {'old_log_probs', 'old_entropy'}
                     for key in batch.batch.keys():
-                        if key != 'old_log_probs':
+                        if key not in float_batch_keys:
                             batch.batch[key] = batch.batch[key].long()
+
+                    if self.use_opd and self.config.do_search and self.config.actor_rollout_ref.actor.state_masking:
+                        batch, metrics = self._create_loss_mask(batch, metrics)
+                    if self.use_opd:
+                        batch, metrics = self._create_opd_distillation_mask(
+                            batch,
+                            metrics,
+                            mask_protocol_tags=bool(
+                                self.config.algorithm.opd.get(
+                                    'mask_protocol_tags', False
+                                )
+                            ),
+                        )
 
                     if self.use_reference_policy:
                         # compute reference log_prob
                         with _timer('ref', timing_raw):
+                            if self.use_opd:
+                                teacher_target = self.config.algorithm.opd.get('teacher_target', 'observed')
+                                if teacher_target == 'evidence_residual' and 'evidence_mask' not in batch.batch:
+                                    raise ValueError('evidence_residual target requires rollout evidence_mask')
+                                batch.meta_info['opd_teacher_target'] = teacher_target
+                                batch.meta_info['opd_entropy_matched_tau'] = \
+                                    self.config.algorithm.opd.get('entropy_matched_tau')
+                                batch.meta_info['opd_target_token_chunk_size'] = \
+                                    self.config.algorithm.opd.get('target_token_chunk_size', 16)
+                                batch.meta_info['opd_evidence_residual_alpha'] = \
+                                    self.config.algorithm.opd.get(
+                                        'evidence_residual_alpha', 1.0
+                                    )
                             ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
 
@@ -775,27 +1691,125 @@ class RayPPOTrainer(object):
                             values = self.critic_wg.compute_values(batch)
                             batch = batch.union(values)
 
+                    if self.use_opd and self.config.algorithm.opd.get('rce', {}).get('enable', False):
+                        batch, metrics = self._create_rce_metadata(batch, metrics)
+
                     with _timer('adv', timing_raw):
-                        # compute scores. Support both model and function-based.
-                        # We first compute the scores using reward model. Then, we call reward_fn to combine
-                        # the results from reward model and rule-based results.
-                        if self.use_rm:
-                            # we first compute reward model score
-                            reward_tensor = self.rm_wg.compute_rm_score(batch)
-                            batch = batch.union(reward_tensor)
-
-                        # we combine with rule-based rm
-                        reward_tensor = self.reward_fn(batch)
-                        batch.batch['token_level_scores'] = reward_tensor
-
-                        # compute rewards. apply_kl_penalty if available
-                        if not self.config.actor_rollout_ref.actor.use_kl_loss:
-                            batch, kl_metrics = apply_kl_penalty(batch,
-                                                                 kl_ctrl=self.kl_ctrl,
-                                                                 kl_penalty=self.config.algorithm.kl_penalty)
-                            metrics.update(kl_metrics)
+                        if self.use_opd:
+                            response_length = batch.batch['responses'].size(-1)
+                            action_opd_mask = batch.batch['loss_mask'] if 'loss_mask' in batch.batch else \
+                                batch.batch['attention_mask'][:, -response_length:]
+                            opd_mask = batch.batch.get(
+                                'opd_distillation_mask', action_opd_mask
+                            )
+                            opd_scores = (batch.batch['ref_log_prob'] - batch.batch['old_log_probs']) * opd_mask
+                            if self.config.algorithm.opd.grpo_reward_coef != 0:
+                                reward_tensor = self.reward_fn(batch)
+                                batch.batch['token_level_scores'] = reward_tensor
+                                batch.batch['token_level_rewards'] = reward_tensor
+                            else:
+                                # Keep rule/EM scores for logging only. Pure OPD training
+                                # still uses the teacher-student log-prob signal below.
+                                reward_tensor = self.reward_fn(batch)
+                                batch.batch['token_level_scores'] = reward_tensor
+                                batch.batch['token_level_rewards'] = opd_scores
+                            lambda_distill = self.config.algorithm.opd.get('lambda_distill')
+                            if lambda_distill is None:
+                                lambda_distill = self.config.algorithm.opd.distillation_coef
+                            batch.meta_info['opd_config'] = {
+                                'advantage_mode': self.config.algorithm.opd.advantage_mode,
+                                'normalize': self.config.algorithm.opd.normalize,
+                                'clip_value': self.config.algorithm.opd.clip_value,
+                                'distillation_coef': lambda_distill,
+                                'lambda_distill': lambda_distill,
+                                'teacher_target': self.config.algorithm.opd.get('teacher_target', 'observed'),
+                                'evidence_residual_alpha': self.config.algorithm.opd.get(
+                                    'evidence_residual_alpha', 1.0
+                                ),
+                                'grpo_reward_coef': self.config.algorithm.opd.grpo_reward_coef,
+                                'use_gated_distillation': self.config.algorithm.opd.get('use_gated_distillation', True),
+                                'gamma': self.config.algorithm.opd.get('gamma', 1.0),
+                                'beta_min': self.config.algorithm.opd.get('beta_min', 0.0),
+                                'beta_max': self.config.algorithm.opd.get('beta_max', 0.05),
+                                'rce': self._plain_config(self.config.algorithm.opd.get('rce', {})),
+                                'sod': self._plain_config(self.config.algorithm.opd.get('sod', {})),
+                            }
+                            metrics.update(
+                                compute_opd_logprob_metrics(
+                                    old_log_probs=batch.batch['old_log_probs'],
+                                    ref_log_prob=batch.batch['ref_log_prob'],
+                                    mask=opd_mask,
+                                ))
+                            metrics['opd/teacher_entropy'] = masked_mean(
+                                batch.batch['ref_entropy'],
+                                opd_mask,
+                            ).item()
+                            teacher_target = self.config.algorithm.opd.get('teacher_target', 'observed')
+                            metrics['opd/teacher_target_is_intervened'] = float(
+                                teacher_target != 'observed')
+                            if teacher_target == 'observed':
+                                metrics['opd/observed_target_backend_is_padded'] = float(
+                                    self.config.actor_rollout_ref.ref.get(
+                                        'observed_target_backend', 'standard'
+                                    ) == 'padded'
+                                )
+                            if teacher_target == 'entropy_matched':
+                                metrics['opd/entropy_matched_tau'] = float(
+                                    self.config.algorithm.opd.entropy_matched_tau)
+                            if teacher_target == 'evidence_residual':
+                                metrics['opd/evidence_residual_alpha'] = float(
+                                    self.config.algorithm.opd.get(
+                                        'evidence_residual_alpha', 1.0
+                                    )
+                                )
+                                evidence_mask = batch.batch['evidence_mask'].float()
+                                valid_context = batch.batch['attention_mask'].float()
+                                metrics['opd/evidence_context_token_fraction'] = (
+                                    evidence_mask.sum() / valid_context.sum()
+                                ).item()
+                                metrics['opd/evidence_trajectory_rate'] = (
+                                    evidence_mask.bool().any(dim=-1).float().mean()
+                                ).item()
+                                metrics['opd/observed_teacher_entropy'] = masked_mean(
+                                    batch.batch['ref_observed_entropy'], opd_mask).item()
+                                metrics['opd/hidden_teacher_entropy'] = masked_mean(
+                                    batch.batch['ref_hidden_entropy'], opd_mask).item()
+                                metrics['opd/er_logprob_shift'] = masked_mean(
+                                    batch.batch['ref_log_prob'] - batch.batch['ref_observed_log_prob'],
+                                    opd_mask,
+                                ).item()
+                                metrics['opd/selected_logit_residual'] = masked_mean(
+                                    batch.batch['ref_selected_logit_delta'], opd_mask).item()
+                            if 'old_entropy' in batch.batch:
+                                metrics['opd/student_entropy'] = masked_mean(
+                                    batch.batch['old_entropy'],
+                                    opd_mask,
+                                ).item()
                         else:
-                            batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
+                            # compute scores. Support both model and function-based.
+                            if self.use_rm:
+                                reward_tensor = self.rm_wg.compute_rm_score(batch)
+                                batch = batch.union(reward_tensor)
+
+                            reward_tensor = self.reward_fn(batch)
+                            batch.batch['token_level_scores'] = reward_tensor
+
+                            if not self.config.actor_rollout_ref.actor.use_kl_loss:
+                                dgpo_config = self.config.algorithm.get('dgpo', {})
+                                batch, kl_metrics = apply_kl_penalty(batch,
+                                                                     kl_ctrl=self.kl_ctrl,
+                                                                     kl_penalty=self.config.algorithm.kl_penalty,
+                                                                     dgpo_selective_kl=bool(
+                                                                         dgpo_config.get('enable', False)
+                                                                     ),
+                                                                     dgpo_reward_threshold=float(
+                                                                         dgpo_config.get(
+                                                                             'reward_threshold', 0.1
+                                                                         )
+                                                                     ))
+                                metrics.update(kl_metrics)
+                            else:
+                                batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
 
                         # compute advantages, executed on the driver process
                         batch = compute_advantage(batch,
@@ -803,6 +1817,104 @@ class RayPPOTrainer(object):
                                                   gamma=self.config.algorithm.gamma,
                                                   lam=self.config.algorithm.lam,
                                                   num_repeat=self.config.actor_rollout_ref.rollout.n)
+                        if self.use_opd:
+                            metrics['opd/distillation_advantage'] = masked_mean(
+                                batch.batch['opd_advantages'], opd_mask
+                            ).item()
+                            metrics['opd/weighted_distillation_advantage'] = masked_mean(
+                                batch.batch['weighted_opd_advantages'], opd_mask
+                            ).item()
+                            metrics['opd/beta'] = masked_mean(
+                                batch.batch['opd_beta'], opd_mask
+                            ).item()
+                            metrics['opd/effective_distillation_coef'] = masked_mean(
+                                batch.batch['opd_effective_distillation_coef'], opd_mask
+                            ).item()
+                            if self.config.algorithm.opd.get('sod', {}).get('enable', False):
+                                sod_weights = batch.batch['opd_sod_stepwise_weights']
+                                metrics['sod/stepwise_weight'] = masked_mean(
+                                    sod_weights, action_opd_mask
+                                ).item()
+                                metrics['sod/step_divergence'] = masked_mean(
+                                    batch.batch['opd_sod_step_divergence'],
+                                    action_opd_mask,
+                                ).item()
+                                metrics['sod/downweighted_token_fraction'] = masked_mean(
+                                    (sod_weights < 1.0).float(),
+                                    action_opd_mask,
+                                ).item()
+                                metrics['sod/upweighted_token_fraction'] = masked_mean(
+                                    (sod_weights > 1.0).float(),
+                                    action_opd_mask,
+                                ).item()
+                            protocol_tag_mask = batch.batch.get(
+                                'opd_protocol_tag_mask'
+                            )
+                            if (
+                                protocol_tag_mask is not None
+                                and protocol_tag_mask.sum().item() > 0
+                            ):
+                                metrics['opd/protocol_tag_logprob_gap_abs'] = masked_mean(
+                                    (
+                                        batch.batch['old_log_probs']
+                                        - batch.batch['ref_log_prob']
+                                    ).abs(),
+                                    protocol_tag_mask,
+                                ).item()
+                                metrics['opd/protocol_tag_advantage_abs'] = masked_mean(
+                                    batch.batch['weighted_opd_advantages'].abs(),
+                                    protocol_tag_mask,
+                                ).item()
+                            if self.config.algorithm.opd.get('rce', {}).get('enable', False):
+                                metrics['opd/rce_weight'] = masked_mean(
+                                    batch.batch['opd_rce_weights'], opd_mask
+                                ).item()
+                                if 'rce_retrieval_hit' in batch.batch:
+                                    rce_retrieval_hit = batch.batch['rce_retrieval_hit'].float()
+                                    rce_known_mask = (
+                                        ((rce_retrieval_hit == 0.0) | (rce_retrieval_hit == 1.0)).float()
+                                        * opd_mask
+                                    )
+                                    hit_mask = (rce_retrieval_hit > 0.5).float() * rce_known_mask
+                                    miss_mask = (rce_retrieval_hit < 0.5).float() * rce_known_mask
+                                    known_tokens = rce_known_mask.sum()
+                                    if known_tokens.item() > 0:
+                                        metrics['opd/rce_known_token_fraction'] = (
+                                            known_tokens / opd_mask.sum()
+                                        ).item()
+                                        metrics['opd/rce_token_hit_rate'] = (
+                                            hit_mask.sum() / known_tokens
+                                        ).item()
+                                    if hit_mask.sum().item() > 0:
+                                        metrics['opd/rce_weight_hit'] = masked_mean(
+                                            batch.batch['opd_rce_weights'], hit_mask
+                                        ).item()
+                                    if miss_mask.sum().item() > 0:
+                                        metrics['opd/rce_weight_miss'] = masked_mean(
+                                            batch.batch['opd_rce_weights'], miss_mask
+                                        ).item()
+                                    if 'opd/rce_weight_hit' in metrics and 'opd/rce_weight_miss' in metrics:
+                                        metrics['opd/rce_weight_delta_hit_minus_miss'] = (
+                                            metrics['opd/rce_weight_hit'] - metrics['opd/rce_weight_miss']
+                                        )
+                            metrics['opd/grpo_advantage'] = masked_mean(
+                                batch.batch['grpo_advantages'], opd_mask
+                            ).item()
+                            metrics['opd/combined_advantage'] = masked_mean(
+                                batch.batch['advantages'], opd_mask
+                            ).item()
+                            if self.opd_diagnostics is not None and self.opd_diagnostics.should_dump(self.global_steps):
+                                with _timer('opd_diagnostics', timing_raw):
+                                    diagnostics_path = self.opd_diagnostics.dump(
+                                        batch=batch,
+                                        opd_mask=opd_mask,
+                                        global_step=self.global_steps,
+                                        epoch=epoch,
+                                        metrics=metrics,
+                                    )
+                                metrics['opd_diagnostics/trajectories'] = float(
+                                    min(self.opd_diagnostics.max_sequences_per_step, len(batch)))
+                                print(f'OPD diagnostics saved: {diagnostics_path}')
 
                     # update critic
                     if self.use_critic:
@@ -815,10 +1927,22 @@ class RayPPOTrainer(object):
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
                         with _timer('update_actor', timing_raw):
-                            if self.config.do_search and self.config.actor_rollout_ref.actor.state_masking:
+                            if not self.use_opd and self.config.do_search and \
+                                    self.config.actor_rollout_ref.actor.state_masking:
                                 batch, metrics = self._create_loss_mask(batch, metrics)
+                            batch.meta_info['token_level_loss_normalization'] = bool(
+                                self.use_opd
+                                and self.config.algorithm.opd.get('teacher_target', 'observed') != 'observed'
+                            )
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
+                        if self.use_opd and 'actor/entropy_loss' in actor_output_metrics:
+                            entropy_key = (
+                                'opd/update_student_entropy'
+                                if 'opd/student_entropy' in metrics
+                                else 'opd/student_entropy'
+                            )
+                            actor_output_metrics[entropy_key] = actor_output_metrics.pop('actor/entropy_loss')
                         metrics.update(actor_output_metrics)
 
                     # validate
@@ -864,4 +1988,62 @@ class RayPPOTrainer(object):
             'state_tokens/coverage': (loss_mask.sum() / response_mask.sum()).item(),
         })
         
+        return batch, metrics
+
+    def _create_opd_distillation_mask(
+        self,
+        batch: DataProto,
+        metrics: dict,
+        mask_protocol_tags: bool = False,
+    ):
+        """Build an OPD-only mask without changing the RL action mask.
+
+        Search-R1 protocol tags are tracked independently for diagnostics. By
+        default they remain in ``opd_distillation_mask`` and receive normal OPD;
+        the optional mask is retained only for explicit ablation runs.
+        """
+        response_length = batch.batch['responses'].shape[-1]
+        response_mask = batch.batch['attention_mask'][:, -response_length:]
+        action_mask = batch.batch.get('loss_mask', response_mask).bool()
+        protocol_tag_mask = torch.zeros_like(action_mask, dtype=torch.bool)
+
+        for seq_idx in range(len(batch)):
+            valid_len = int(response_mask[seq_idx].sum().item())
+            response_ids = batch.batch['responses'][
+                seq_idx, :valid_len
+            ].detach().cpu().tolist()
+            token_texts = [
+                _decode_token(self.tokenizer, int(token_id))
+                for token_id in response_ids
+            ]
+            segments, _ = infer_token_segments(token_texts)
+            if segments:
+                protocol_tag_mask[seq_idx, :valid_len] = torch.tensor(
+                    [segment == 'tag' for segment in segments],
+                    dtype=torch.bool,
+                    device=protocol_tag_mask.device,
+                )
+
+        protocol_tag_mask &= action_mask
+        if mask_protocol_tags:
+            distillation_mask = action_mask & ~protocol_tag_mask
+        else:
+            distillation_mask = action_mask
+
+        batch.batch['opd_protocol_tag_mask'] = protocol_tag_mask
+        batch.batch['opd_distillation_mask'] = distillation_mask
+
+        action_tokens = float(action_mask.sum().item())
+        tag_tokens = float(protocol_tag_mask.sum().item())
+        distillation_tokens = float(distillation_mask.sum().item())
+        metrics.update({
+            'opd/protocol_tag_tokens': tag_tokens,
+            'opd/protocol_tag_token_fraction': (
+                tag_tokens / action_tokens if action_tokens > 0 else 0.0
+            ),
+            'opd/distillation_token_coverage': (
+                distillation_tokens / action_tokens if action_tokens > 0 else 0.0
+            ),
+            'opd/config/mask_protocol_tags': float(mask_protocol_tags),
+        })
         return batch, metrics

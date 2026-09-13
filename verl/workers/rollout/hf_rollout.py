@@ -75,7 +75,15 @@ class HFRollout(BaseRollout):
 
         temperature = prompts.meta_info.get('temperature', self.config.temperature)
 
-        generation_config = GenerationConfig(temperature=temperature, top_p=top_p, top_k=top_k)
+        suppress_tokens = None
+        if self.config.get('restrict_to_tokenizer_vocab', False):
+            suppress_tokens = list(range(self.config.logit_vocab_size, self.config.model_vocab_size))
+        generation_config = GenerationConfig(
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            suppress_tokens=suppress_tokens,
+        )
 
         if isinstance(self.module, FSDP):
             # recurse need to set to False according to https://github.com/pytorch/pytorch/issues/100069
@@ -112,6 +120,13 @@ class HFRollout(BaseRollout):
 
         prompt = seq[:, :prompt_length]  # (bs, prompt_length)
         response = seq[:, prompt_length:]  # (bs, response_length)
+        if self.config.get('restrict_to_tokenizer_vocab', False):
+            invalid = response[(response != pad_token_id) & (response >= self.config.logit_vocab_size)]
+            if invalid.numel() > 0:
+                raise ValueError(
+                    'HF rollout sampled an id outside the shared tokenizer vocabulary: '
+                    f'{invalid[0].item()} >= {self.config.logit_vocab_size}'
+                )
 
         response_length = response.size(1)
         delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)

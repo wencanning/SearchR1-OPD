@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import random
 from collections import Counter
 
 import pandas as pd
@@ -13,6 +14,8 @@ def parse_args():
     parser.add_argument("--input-jsonl", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--val-ratio", type=float, default=0.02)
+    parser.add_argument("--train-size", type=int, default=None,
+                        help="Exact train size after filtering/deduplication; all remaining rows become validation.")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--require-quality-pass", action="store_true")
     parser.add_argument("--dedupe-key", default="question")
@@ -62,7 +65,13 @@ def main():
         require_quality_pass=args.require_quality_pass,
         dedupe_key=args.dedupe_key,
     )
-    train_rows, val_rows = split_train_val_rows(rows, val_ratio=args.val_ratio, seed=args.seed)
+    if args.train_size is not None:
+        if not 0 < args.train_size < len(rows):
+            raise ValueError(f"train-size must leave nonempty train and val splits; got {args.train_size} of {len(rows)}")
+        random.Random(args.seed).shuffle(rows)
+        train_rows, val_rows = rows[:args.train_size], rows[args.train_size:]
+    else:
+        train_rows, val_rows = split_train_val_rows(rows, val_ratio=args.val_ratio, seed=args.seed)
 
     rows_to_dataframe(train_rows, val_rows).to_parquet(os.path.join(args.output_dir, "train.parquet"))
     rows_to_dataframe(val_rows, train_rows).to_parquet(os.path.join(args.output_dir, "val.parquet"))

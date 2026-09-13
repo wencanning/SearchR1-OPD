@@ -1,10 +1,12 @@
-export CUDA_VISIBLE_DEVICES=7,6
+export CUDA_VISIBLE_DEVICES=0,1
+export NO_PROXY="${NO_PROXY:+${NO_PROXY},}127.0.0.1,localhost"
+export no_proxy="${no_proxy:+${no_proxy},}127.0.0.1,localhost"
 export DATA_DIR='data/nq_hotpotqa_train'
 export TRAIN_DATA_DIR=$DATA_DIR
 export TEST_DATA_DIR=$DATA_DIR
 
 
-WAND_PROJECT='Search-R1'
+WAND_PROJECT='Search-R1-Eval'
 
 # export BASE_MODEL='meta-llama/Llama-3.2-3B'
 # export EXPERIMENT_NAME=nq-search-r1-grpo-llama3.2-3b-em
@@ -15,8 +17,8 @@ WAND_PROJECT='Search-R1'
 # export BASE_MODEL='meta-llama/Llama-3.1-8B-Instruct'
 # export EXPERIMENT_NAME=nq-search-r1-grpo-llama3.1-8b-it-em
 
-export BASE_MODEL='/data/home/wencanning/workplace/vllm_server/model/Qwen2.5-3B-Instruct'
-export EXPERIMENT_NAME=search-r1-grpo-qwen2.5-3b-em
+export BASE_MODEL=verl_checkpoints/nq-search-r1-rcod-plain-opd/actor/global_step_100
+export EXPERIMENT_NAME=rcod-rl-0.5B-eval
 # export BASE_MODEL='Qwen/Qwen2.5-3B-Instruct'
 # export EXPERIMENT_NAME=nq-search-r1-grpo-qwen2.5-3b-it-em
 # export BASE_MODEL='Qwen/Qwen2.5-7B'
@@ -35,7 +37,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     data.train_data_num=null \
     data.val_data_num=null \
     data.train_batch_size=64  \
-    data.val_batch_size=64 \
+    data.val_batch_size=512 \
     data.max_prompt_length=4096 \
     data.max_response_length=512 \
     data.max_start_length=2048 \
@@ -62,12 +64,12 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     algorithm.no_think_rl=false \
-    actor_rollout_ref.rollout.n_agent=8 \
+    actor_rollout_ref.rollout.n_agent=1 \
     actor_rollout_ref.rollout.temperature=1 \
     actor_rollout_ref.actor.state_masking=true \
     trainer.logger=['wandb'] \
-    +trainer.val_only=false \
-    +trainer.val_before_train=false \
+    +trainer.val_only=true \
+    +trainer.val_before_train=true \
     trainer.default_hdfs_dir=null \
     trainer.n_gpus_per_node=2 \
     trainer.nnodes=1 \
@@ -79,7 +81,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     trainer.total_training_steps=300 \
     trainer.default_hdfs_dir=null \
     trainer.default_local_dir=verl_checkpoints/$EXPERIMENT_NAME \
-    max_turns=2 \
+    max_turns=4 \
     retriever.url="http://127.0.0.1:8000/retrieve" \
     retriever.topk=3 \
     2>&1 | tee $EXPERIMENT_NAME.log

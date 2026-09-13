@@ -1,1 +1,4 @@
-Copyright 2023-2024 Bytedance Ltd. and/or its affiliates 
+Copyright 2023-2024 Bytedance Ltd. and/or its affiliates
+
+The SOD step-wise on-policy distillation weighting is adapted from
+YoungZ365/SOD (https://github.com/YoungZ365/SOD), licensed under Apache-2.0.

@@ -1,0 +1,58 @@
+{
+  "base": "cuda12.1 + python3.9",
+  "system_pkgs": [
+    "git",
+    "tmux"
+  ],
+  "pip_phases": [
+    [
+      "torch==2.4.0+cu121"
+    ],
+    [
+      "ray==2.51.2",
+      "transformers==4.47.1",
+      "vllm==dev",
+      "flash-attn"
+    ]
+  ],
+  "env": {
+    "CONDA_DEFAULT_ENV": "searchr1",
+    "CUDA_VISIBLE_DEVICES": "2,3",
+    "NO_PROXY": "127.0.0.1,localhost"
+  },
+  "run_commands": [
+    "conda activate searchr1",
+    "./train_er_opd.sh"
+  ],
+  "weight_dirs": {
+    "student": {
+      "path": "data/student/1B",
+      "source": "local checkpoint",
+      "gated": false
+    },
+    "teacher": {
+      "path": "/data/home/wencanning/models/SearchR1-nq_hotpotqa_train-qwen2.5-7b-it-em-grpo-v0.3",
+      "source": "local checkpoint",
+      "gated": false
+    }
+  },
+  "smoke": {
+    "import_names": [
+      "torch",
+      "ray",
+      "vllm",
+      "transformers",
+      "flash_attn"
+    ],
+    "gpu_tests": [
+      {
+        "cmd": "python -c seeded 8x8 matmul on both visible CUDA devices",
+        "expect": "WITNESS 2.4.0+cu121"
+      }
+    ],
+    "cli_checks": [
+      "nvidia-smi",
+      "POST http://127.0.0.1:8000/retrieve"
+    ]
+  }
+}

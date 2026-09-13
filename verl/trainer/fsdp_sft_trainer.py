@@ -242,7 +242,8 @@ class FSDPSFTTrainer(object):
                                                             num_training_steps=total_steps)
 
     def _compute_loss(self, batch):
-        loss_mask = batch.pop('loss_mask')[:, :-1].reshape(-1).cuda()
+        # Each logit predicts the next token, so mask the target position too.
+        loss_mask = batch.pop('loss_mask')[:, 1:].reshape(-1).cuda()
         labels = batch['input_ids'][:, 1:].cuda()
 
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):

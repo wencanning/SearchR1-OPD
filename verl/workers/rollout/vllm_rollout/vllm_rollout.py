@@ -24,6 +24,7 @@ When working with Megatron:
 - Do inference in tp. pp is treated as additional dp
 - After inference, all the parameters that doesn't belong to this pp rank is freed.
 """
+from functools import partial
 from typing import List
 from contextlib import contextmanager
 from omegaconf import DictConfig
@@ -34,6 +35,7 @@ from torch import nn
 
 from verl import DataProto
 from verl.utils.torch_functional import get_eos_mask, pad_sequence_to_length
+from verl.utils.tokenizer import mask_vllm_logits_to_tokenizer_vocab
 from verl.workers.rollout.base import BaseRollout
 from verl.third_party.vllm import LLM, vllm_version
 from verl.third_party.vllm import parallel_state as vllm_ps
@@ -88,12 +90,16 @@ class vLLMRollout(BaseRollout):
 
         assert model_hf_config.max_position_embeddings >= config.prompt_length + config.response_length, \
             "model context length should be greater than total sequence length"
+        rollout_seed = config.get('seed')
+        if rollout_seed is None:
+            rollout_seed = 0
         self.inference_engine = LLM(actor_module,
                                     tokenizer=tokenizer,
                                     model_hf_config=model_hf_config,
                                     tensor_parallel_size=tensor_parallel_size,
                                     dtype=config.dtype,
                                     enforce_eager=config.enforce_eager,
+                                    seed=int(rollout_seed),
                                     gpu_memory_utilization=config.gpu_memory_utilization,
                                     skip_tokenizer_init=False,
                                     max_model_len=config.prompt_length + config.response_length,
@@ -111,6 +117,13 @@ class vLLMRollout(BaseRollout):
         # we may detokenize the result all together later
         if vllm_version in ('0.4.2', '0.5.4', '0.6.3'):
             kwargs['detokenize'] = False
+
+        if config.get('restrict_to_tokenizer_vocab', False):
+            if not hasattr(SamplingParams(), 'logits_processors'):
+                raise ValueError('this vLLM build cannot mask logits to the shared tokenizer vocabulary')
+            kwargs['logits_processors'] = [
+                partial(mask_vllm_logits_to_tokenizer_vocab, int(config.logit_vocab_size))
+            ]
 
         # supporting adding any sampling params from the config file
         for k in config.keys():
@@ -182,6 +195,13 @@ class vLLMRollout(BaseRollout):
         # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
         response = output[0].to(idx.device)
         log_probs = output[1].to(idx.device)
+        if self.config.get('restrict_to_tokenizer_vocab', False):
+            invalid = response[(response != self.pad_token_id) & (response >= self.config.logit_vocab_size)]
+            if invalid.numel() > 0:
+                raise ValueError(
+                    'vLLM sampled an id outside the shared tokenizer vocabulary: '
+                    f'{invalid[0].item()} >= {self.config.logit_vocab_size}'
+                )
 
         if response.shape[1] < self.config.response_length:
             response = pad_sequence_to_length(response, self.config.response_length, self.pad_token_id)

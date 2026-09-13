@@ -1,0 +1,7 @@
+{"device": "NVIDIA A100-SXM4-80GB", "torch": "2.4.0+cu121", "rows": 512, "vocab_size": 152064}
+{"chunk_size": 16, "elapsed_s": 0.05845812801271677, "rows_per_s": 8758.405672665765, "incremental_peak_gib": 0.03636503219604492, "checksum": -89.63047844916582}
+{"chunk_size": 32, "elapsed_s": 0.02323523722589016, "rows_per_s": 22035.49699202113, "incremental_peak_gib": 0.07256698608398438, "checksum": -89.63047838956118}
+{"chunk_size": 64, "elapsed_s": 0.018298940267413855, "rows_per_s": 27979.762353328875, "incremental_peak_gib": 0.148468017578125, "checksum": -89.63047838956118}
+{"chunk_size": 128, "elapsed_s": 0.22844997700303793, "rows_per_s": 2241.190858133426, "incremental_peak_gib": 0.2900562286376953, "checksum": -89.6304786875844}
+{"chunk_size": 256, "elapsed_s": 0.022080056369304657, "rows_per_s": 23188.34659823488, "incremental_peak_gib": 0.5800971984863281, "checksum": -89.6304786875844}
+{"chunk_size": 512, "elapsed_s": 0.017685865983366966, "rows_per_s": 28949.670911309677, "incremental_peak_gib": 1.1640796661376953, "checksum": -89.63047910481691}

@@ -22,6 +22,9 @@ actor_rollout_ref:
     ppo_mini_batch_size: 256
     ppo_micro_batch_size: 64
     clip_ratio: 0.2
+    clip_ratio_low: null
+    clip_ratio_high: null
+    clip_ratio_c: 3.0
     entropy_coeff: 0.001
     ppo_epochs: 1
     shuffle: True

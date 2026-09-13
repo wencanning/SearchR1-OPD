@@ -2,6 +2,9 @@ data:
   tokenizer: null
   train_files: ~/data/rlhf/gsm8k/train.parquet
   val_files: ~/data/rlhf/gsm8k/test.parquet
+  # Optional exact-match filter on the parquet data_source column.
+  train_data_source: null
+  val_data_source: null
   train_data_num: null
   val_data_num: null
   prompt_key: prompt
@@ -20,6 +23,7 @@ actor_rollout_ref:
   model:
     path: ~/models/deepseek-llm-7b-chat
     external_lib: null
+    attn_implementation: flash_attention_2
     override_config: { }
     enable_gradient_checkpointing: False
     use_remove_padding: False
@@ -32,6 +36,11 @@ actor_rollout_ref:
     grad_clip: 1.0
     state_masking: False
     clip_ratio: 0.2
+    # Optional asymmetric PPO clipping. Null values fall back to clip_ratio.
+    clip_ratio_low: null
+    clip_ratio_high: null
+    # Dual-clip bound for negative advantages. Must be greater than 1.
+    clip_ratio_c: 3.0
     entropy_coeff: 0.001
     use_kl_loss: False # True for GRPO
     kl_loss_coef: 0.001 # for grpo
@@ -54,8 +63,33 @@ actor_rollout_ref:
       optimizer_offload: False
       fsdp_size: -1
   ref:
+    # Optional independent teacher checkpoint. Defaults to actor model.path.
+    model_path: null
+    # Ordinary observed targets use the legacy log-prob path by default. The
+    # padded backend scores only policy-token rows with the real attention mask
+    # and computes normalization statistics in FP32; SOD opts into it.
+    observed_target_backend: standard
+    # Evidence interventions require sdpa so a per-sample 4D additive mask is honored.
+    attn_implementation: flash_attention_2
+    # Strict ER/control launchers override all three precision settings to FP32.
+    target_forward_dtype: bfloat16
+    # Non-FP32 target logits are an explicit speed/precision tradeoff. ER
+    # residual construction and vocabulary normalization still run in FP32.
+    allow_approximate_target_precision: False
+    # Exact target-path optimizations. Selection skips LM-head rows excluded by
+    # loss_mask; trimming removes only prompt columns padded for the whole batch.
+    target_select_policy_logits: True
+    target_trim_shared_prompt_padding: True
+    # A100 TensorFloat-32 acceleration for FP32 teacher matrix multiplications.
+    # Output logits and ER normalization remain FP32.
+    allow_tf32: False
     fsdp_config:
+      model_dtype: null
       param_offload: False
+      mixed_precision:
+        param_dtype: bf16
+        reduce_dtype: fp32
+        buffer_dtype: fp32
       wrap_policy:
         # transformer_layer_cls_to_wrap: None
         min_num_params: 0
@@ -67,6 +101,11 @@ actor_rollout_ref:
   rollout:
     name: vllm
     temperature: 1.0
+    seed: null
+    # Validation remains greedy unless explicitly enabled by evaluate_loop.sh.
+    val_do_sample: False
+    # Intervened OPD targets require sampling only from tokenizer-defined IDs.
+    restrict_to_tokenizer_vocab: False
     top_k: -1 # 0 for hf rollout, -1 for vllm rollout
     top_p: 0.95
     prompt_length: ${data.max_prompt_length}  # not use for opensource
@@ -153,6 +192,73 @@ algorithm:
   gamma: 1.0
   lam: 1.0
   adv_estimator: gae
+  # Distillation-Guided Policy Optimization (omron-sinicx/dgpo). The baseline
+  # launcher opts in and supplies a KD-initialized student plus a teacher model.
+  # When enabled, KL guidance is applied only to trajectories whose token-level
+  # task rewards are all below reward_threshold, matching the official code.
+  dgpo:
+    enable: false
+    reward_threshold: 0.1
+  opd:
+    # token: distill each sampled token; sequence: use future cumulative K1 signal
+    advantage_mode: token
+    normalize: False
+    clip_value: null
+    distillation_coef: 1.0
+    # Distill protocol syntax by default; masking tags can create a zero-OPD escape route.
+    mask_protocol_tags: false
+    # Fixed coefficient used by evidence_residual and entropy_matched targets.
+    # Null preserves distillation_coef for existing OPD configurations.
+    lambda_distill: null
+    # observed: ordinary teacher; evidence_residual uses
+    # softmax(z_obs + evidence_residual_alpha * (z_obs-z_hidden));
+    # entropy_matched: softmax(z_obs/tau) with one pre-calibrated global tau.
+    teacher_target: observed
+    # 0 recovers observed OPD; 1 recovers the original 2*z_obs-z_hidden target.
+    evidence_residual_alpha: 1.0
+    entropy_matched_tau: null
+    target_token_chunk_size: 16
+    # Set > 0 to add group-normalized Search-R1 outcome reward to OPD.
+    grpo_reward_coef: 0.0
+    # Gate token-level distillation by task advantage for OPD+RL.
+    use_gated_distillation: true
+    gamma: 1.0
+    beta_min: 0.0
+    beta_max: 0.05
+    # Retrieval-Conditioned Entropy-gated OPD. Disabled by default.
+    rce:
+      enable: false
+      entropy_normalization: percentile_rank  # percentile_rank, robust_minmax, none
+      w_min: 0.1
+      w_max: 1.0
+      alpha: 4.0
+      tau: 0.0
+      default_retrieval_hit: 0.5
+      eps: 1.0e-8
+    # SOD: step-wise OPD weighting from YoungZ365/SOD. The dedicated launcher
+    # opts in; keeping this false preserves every existing OPD/ER-OPD path.
+    sod:
+      enable: false
+      epsilon: 1.0e-6
+      delta: 0.2
+    # TCOD-F2B: progressively expose the student to a longer interaction
+    # horizon. Validation keeps using the full top-level max_turns value.
+    tcod:
+      enable: false
+      variant: f2b
+      start_turns: 1
+      checkpoint_steps: 25
+    diagnostics:
+      enable: false
+      output_dir: null
+      every_n_steps: 1
+      max_sequences_per_step: 64
+      sample_strategy: random  # random, head, entropy_top
+      float_precision: 4
+      include_token_text: true
+      include_decoded_response: true
+      top_entropy_tokens: 32
+      compress: false
   no_think_rl: False
   kl_penalty: kl  # how to estimate kl divergence
   kl_ctrl:
@@ -175,6 +281,15 @@ trainer:
   critic_warmup: 0
   default_hdfs_dir: ~/experiments/gsm8k/ppo/${trainer.experiment_name}
   default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
+  er_entropy_calibration:
+    enable: False
+    fraction: 0.05
+    split_seed: 42
+    decode_seed: 42
+    data_source: hotpotqa
+    entropy_tolerance: 1.0e-6
+    relative_temperature_tolerance: 1.0e-8
+    output_path: refine-logs/ER_ENTROPY_CALIBRATION.json
 
 max_turns: 10
 do_search: true

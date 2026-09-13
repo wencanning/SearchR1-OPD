@@ -105,7 +105,10 @@ import hydra
 def main(config):
     if not ray.is_initialized():
         # this is for local ray cluster
-        ray.init(runtime_env={'env_vars': {'TOKENIZERS_PARALLELISM': 'true', 'NCCL_DEBUG': 'WARN'}})
+        ray.init(
+            address='local',
+            runtime_env={'env_vars': {'TOKENIZERS_PARALLELISM': 'true', 'NCCL_DEBUG': 'WARN'}},
+        )
 
     ray.get(main_task.remote(config))
 
@@ -130,6 +133,31 @@ def main_task(config):
     from verl.utils import hf_tokenizer
     tokenizer = hf_tokenizer(local_path)
 
+    use_dgpo = bool(config.algorithm.get('dgpo', {}).get('enable', False))
+    if config.algorithm.adv_estimator == 'opd' or use_dgpo:
+        if config.actor_rollout_ref.actor.strategy != 'fsdp':
+            raise NotImplementedError(
+                'training with an independent teacher currently supports the FSDP strategy only'
+            )
+
+        teacher_path = config.actor_rollout_ref.ref.model_path
+        if not teacher_path:
+            method = 'DGPO' if use_dgpo else 'OPD'
+            raise ValueError(
+                f'{method} requires actor_rollout_ref.ref.model_path to point to the teacher checkpoint'
+            )
+
+        teacher_local_path = copy_local_path_from_hdfs(teacher_path)
+        teacher_tokenizer = hf_tokenizer(teacher_local_path)
+        from transformers import AutoConfig
+        from verl.utils.tokenizer import validate_same_model_vocab, validate_same_tokenizer_vocab
+        validate_same_tokenizer_vocab(tokenizer, teacher_tokenizer)
+        validate_same_model_vocab(
+            AutoConfig.from_pretrained(local_path),
+            AutoConfig.from_pretrained(teacher_local_path),
+            tokenizer,
+        )
+
     # define worker classes
     if config.actor_rollout_ref.actor.strategy == 'fsdp':
         assert config.actor_rollout_ref.actor.strategy == config.critic.strategy
@@ -148,11 +176,13 @@ def main_task(config):
 
     from verl.trainer.ppo.ray_trainer import ResourcePoolManager, Role
 
+    is_val_only = bool(config.trainer.get('val_only', False))
     role_worker_mapping = {
         Role.ActorRollout: ray.remote(ActorRolloutRefWorker),
         Role.Critic: ray.remote(CriticWorker),
-        Role.RefPolicy: ray.remote(ActorRolloutRefWorker),
     }
+    if not is_val_only:
+        role_worker_mapping[Role.RefPolicy] = ray.remote(ActorRolloutRefWorker)
 
     global_pool_id = 'global_pool'
     resource_pool_spec = {
@@ -161,8 +191,9 @@ def main_task(config):
     mapping = {
         Role.ActorRollout: global_pool_id,
         Role.Critic: global_pool_id,
-        Role.RefPolicy: global_pool_id,
     }
+    if not is_val_only:
+        mapping[Role.RefPolicy] = global_pool_id
 
     # we should adopt a multi-source reward function here
     # - for rule-based rm, we directly call a reward score

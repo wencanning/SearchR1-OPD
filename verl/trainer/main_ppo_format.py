@@ -16,6 +16,7 @@ Note that we don't combine the main with ray_trainer as ray_trainer is used by o
 """
 
 from verl import DataProto
+import os
 import torch
 from verl.utils.reward_score import qa_em, qa_em_format
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
@@ -105,7 +106,9 @@ import hydra
 def main(config):
     if not ray.is_initialized():
         # this is for local ray cluster
-        ray.init(runtime_env={'env_vars': {'TOKENIZERS_PARALLELISM': 'true', 'NCCL_DEBUG': 'WARN'}})
+        ray_init_address = os.environ.get("RAY_INIT_ADDRESS", "local")
+        ray.init(address=ray_init_address,
+                 runtime_env={'env_vars': {'TOKENIZERS_PARALLELISM': 'true', 'NCCL_DEBUG': 'WARN'}})
 
     ray.get(main_task.remote(config))
 
@@ -129,6 +132,23 @@ def main_task(config):
     # instantiate tokenizer
     from verl.utils import hf_tokenizer
     tokenizer = hf_tokenizer(local_path)
+
+    if config.algorithm.adv_estimator == 'opd':
+        if config.actor_rollout_ref.actor.strategy != 'fsdp':
+            raise NotImplementedError('OPD with an independent teacher currently supports the FSDP strategy only')
+        teacher_path = config.actor_rollout_ref.ref.model_path
+        if not teacher_path:
+            raise ValueError('OPD requires actor_rollout_ref.ref.model_path to point to the teacher checkpoint')
+        teacher_local_path = copy_local_path_from_hdfs(teacher_path)
+        teacher_tokenizer = hf_tokenizer(teacher_local_path)
+        from transformers import AutoConfig
+        from verl.utils.tokenizer import validate_same_model_vocab, validate_same_tokenizer_vocab
+        validate_same_tokenizer_vocab(tokenizer, teacher_tokenizer)
+        validate_same_model_vocab(
+            AutoConfig.from_pretrained(local_path),
+            AutoConfig.from_pretrained(teacher_local_path),
+            tokenizer,
+        )
 
     # define worker classes
     if config.actor_rollout_ref.actor.strategy == 'fsdp':
