@@ -1,0 +1,15 @@
+{
+  "base": "Existing repository .venv Python3.12, no installs",
+  "torch": "2.4.0+cu121",
+  "transformers": "4.47.1",
+  "device": "Physical GPU5 UUID GPU-2abc6681-2116-879c-a361-749edb32ac3b",
+  "cpus": 4,
+  "dtype": "bfloat16",
+  "attention": "eager",
+  "allocator_limit_gib": 6,
+  "watchdog_own_stop_gib": 8,
+  "watchdog_min_free_gib": 12,
+  "startup_min_free_gib": 20,
+  "checkpoint": "verl_checkpoints/opd-grpo-0.5B/actor/global_step_50",
+  "witness": ".venv/bin/python scripts/experiments/er_next/run_gpu5_guarded.py --states reports/er_next_20260916/fork_states.frozen.json --checkpoint verl_checkpoints/opd-grpo-0.5B/actor/global_step_50 --out reports/er_next_20260916/gpu_fork_witness --limit 1 --replicates 1 --witness-only"
+}

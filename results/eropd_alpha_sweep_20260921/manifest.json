@@ -1,0 +1,39 @@
+{
+  "gpus": [
+    2,
+    3
+  ],
+  "val_batch_size": 512,
+  "seed": 42,
+  "poll_seconds": 0.2,
+  "reservation_gib_per_gpu": 8,
+  "jobs": [
+    {
+      "alpha": "0",
+      "model": "verl_checkpoints/opd-grpo-0.5B/actor/global_step_150",
+      "note": "alpha0 is observed OPD baseline."
+    },
+    {
+      "alpha": "0.5",
+      "model": "verl_checkpoints/eropd-alpha05-from-6bpwblvv-step50-20260912_164223/actor/global_step_150",
+      "note": ""
+    },
+    {
+      "alpha": "1",
+      "model": "verl_checkpoints/eropd-grpo-05B-test-alpha1/actor/global_step_150",
+      "note": ""
+    },
+    {
+      "alpha": "1.5",
+      "model": "verl_checkpoints/eropd-grpo-05B-test-alpha15/actor/global_step_100",
+      "note": ""
+    },
+    {
+      "alpha": "2",
+      "model": "verl_checkpoints/eropd-grpo-05B-test-alpha2/actor/global_step_100",
+      "note": "Directory says alpha2 but saved training config says 1.5; not verified alpha2."
+    }
+  ],
+  "waiting_free_margin_gib": 2,
+  "waiting_reservation": "all free memory minus 2 GiB, rounded down to 256 MiB"
+}

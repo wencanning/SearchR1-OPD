@@ -1,0 +1,4 @@
+# Generated matplotlib SVG paths contain harmless trailing spaces.
+*.svg -whitespace
+# Python csv.writer emits CRLF; keep original result/figure bytes.
+*.csv whitespace=cr-at-eol

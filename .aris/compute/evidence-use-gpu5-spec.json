@@ -1,0 +1,8 @@
+{
+  "base": "existing repository .venv Python 3.12.13; no environment changes",
+  "packages": {"torch": "2.4.0+cu121", "transformers": "4.47.1"},
+  "tier": {"cpus": 2, "gpus": 1, "gpu_memory_gib": 80},
+  "env": {"CUDA_VISIBLE_DEVICES": "GPU-2abc6681-2116-879c-a361-749edb32ac3b", "HF_HUB_OFFLINE": "1", "OMP_NUM_THREADS": "2", "OPENBLAS_NUM_THREADS": "1"},
+  "inference": {"dtype": "bfloat16", "attention": "sdpa", "do_sample": false},
+  "witness": "CUDA_VISIBLE_DEVICES=GPU-2abc6681-2116-879c-a361-749edb32ac3b HF_HUB_OFFLINE=1 OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=1 .venv/bin/python scripts/experiments/evidence_use/witness.py"
+}

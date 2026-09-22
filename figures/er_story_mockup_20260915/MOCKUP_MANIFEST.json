@@ -1,0 +1,14 @@
+{
+  "data_status": "SYNTHETIC_LAYOUT_MOCKUP_NOT_EXPERIMENTAL_RESULTS",
+  "data_sha256": "e3acaadb83c05dea881fce1108c37dc47771a2eb47c5433b3082e07f82df021c",
+  "script_sha256": "34eaaff25140a1ffe9fd6439fe59ce04e7bb30707acf309b9c50d621b07b97b1",
+  "matplotlib": "3.11.2",
+  "new_experiments_run": false,
+  "error_bars": "none; no fabricated confidence intervals",
+  "formats": [
+    "pdf",
+    "svg",
+    "png"
+  ],
+  "skill": "scientific-figure-making"
+}

@@ -1,0 +1,23 @@
+{
+  "alpha": "2",
+  "model": "verl_checkpoints/eropd-grpo-05B-test-alpha2/actor/global_step_100",
+  "note": "Directory says alpha2 but saved training config says 1.5; not verified alpha2.",
+  "metrics": {
+    "nq": 0.33240997229916897,
+    "triviaqa": 0.4856359939892159,
+    "popqa": 0.4110885259690194,
+    "hotpotqa": 0.2929101958136394,
+    "2wikimultihopqa": 0.25819020356234096,
+    "musique": 0.07405875051717005,
+    "bamboogle": 0.192,
+    "Avg": 0.292327663164365
+  },
+  "checkpoint_step": 100,
+  "status": "completed",
+  "returncode": 0,
+  "validation_batches": 102,
+  "seed": 42,
+  "val_batch_size": 512,
+  "source_result": "eval_loop_logs/eropd_alpha0to2_gpu23_20260921_retry0901/alpha2/completed.json",
+  "source_sha256": "d473c29039f41c2981a81ea9e671a2a3a4972befe2562dd15e9f7647ee1a1970"
+}

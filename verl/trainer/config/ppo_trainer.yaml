@@ -17,6 +17,7 @@ data:
   return_raw_input_ids: False  # This should be set to true when the tokenizer between policy and rm differs
   return_raw_chat: False
   shuffle_train_dataloader: True
+  train_seed: null
 
 actor_rollout_ref:
   hybrid_engine: True
@@ -239,6 +240,7 @@ algorithm:
     # opts in; keeping this false preserves every existing OPD/ER-OPD path.
     sod:
       enable: false
+      allow_no_grpo_ablation: false
       epsilon: 1.0e-6
       delta: 0.2
     # TCOD-F2B: progressively expose the student to a longer interaction

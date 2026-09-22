@@ -1,0 +1,15 @@
+{
+  "model": "verl_checkpoints/sod-grpo-coef0.5-1B/actor/global_step_150",
+  "metrics": {
+    "nq": 0.4055401662049862,
+    "triviaqa": 0.5836648103951206,
+    "popqa": 0.4214621153711362,
+    "hotpotqa": 0.38946657663740714,
+    "2wikimultihopqa": 0.3877226463104326,
+    "musique": 0.1452213487794787,
+    "bamboogle": 0.32,
+    "Avg": 0.3790110948140802
+  },
+  "source_result": "eval_loop_logs/sod_15b_after_sft_fixed_20260912/completed.json",
+  "source_sha256": "f03cfdf54fa03620fa8995112f1febc34468e2aaaa7772107a522eec8dcf6476"
+}

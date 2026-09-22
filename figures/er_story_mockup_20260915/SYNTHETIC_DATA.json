@@ -1,0 +1,84 @@
+{
+  "data_status": "SYNTHETIC_LAYOUT_MOCKUP_NOT_EXPERIMENTAL_RESULTS",
+  "purpose": "User-authorized invented numbers for visual layout review only. Not evidence for scientific claims.",
+  "panel_a": {
+    "metric": "Share of evidence-sufficient states (%)",
+    "categories": [
+      "Already correct",
+      "Helps, still wrong",
+      "No helpful update"
+    ],
+    "values": [
+      [
+        47,
+        50,
+        49,
+        46,
+        48,
+        45,
+        47
+      ],
+      [
+        29,
+        28,
+        31,
+        34,
+        32,
+        36,
+        35
+      ],
+      [
+        24,
+        22,
+        20,
+        20,
+        20,
+        19,
+        18
+      ]
+    ],
+    "dataset": "HotpotQA training trajectories",
+    "steps": [
+      0,
+      20,
+      40,
+      60,
+      80,
+      100,
+      120
+    ],
+    "x_axis": "Student training step; illustrative checkpoint positions, not actual completed checkpoints"
+  },
+  "panel_b": {
+    "population": "States where the observed teacher receives a helpful but insufficient evidence update, defined without ER scores",
+    "metric": "Pairwise support for the correct answer (%)",
+    "conditions": [
+      "Evidence\nhidden",
+      "Evidence\nvisible",
+      "Adjusted\ntarget"
+    ],
+    "shared_prefix": [
+      18,
+      36
+    ],
+    "er_target": 68,
+    "entropy_matched_control": 29,
+    "decision_threshold": 50
+  },
+  "panel_c": {
+    "metric": "Student errors corrected (%) among initially wrong held-out student answers in the fixed pre-training teacher cohort",
+    "methods": [
+      "OPD",
+      "SOD",
+      "ER-OPD"
+    ],
+    "values": [
+      52,
+      55,
+      64
+    ],
+    "error_bars": "Omitted: no real replications exist for this mockup",
+    "denominator": "Frozen initial-student errors; held-out from training; same questions for every method",
+    "dataset": "HotpotQA held-out probe set"
+  }
+}

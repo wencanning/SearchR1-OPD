@@ -1,0 +1,9 @@
+{
+  "base": "existing .venv Python 3.12.13; no installs or changes",
+  "packages": {"torch": "2.4.0+cu121", "transformers": "4.47.1"},
+  "tier": {"cpus": 8, "memory_gib_estimate": 50, "gpus": 0},
+  "env": {"CUDA_VISIBLE_DEVICES": "", "HF_HUB_OFFLINE": "1", "OMP_NUM_THREADS": "8", "MKL_NUM_THREADS": "8", "OPENBLAS_NUM_THREADS": "1"},
+  "model": "/data/home/wencanning/models/SearchR1-nq_hotpotqa_train-qwen2.5-7b-it-em-grpo-v0.3",
+  "inference": {"device": "cpu", "dtype": "float32", "attention": "eager", "use_cache": false},
+  "witness": "CUDA_VISIBLE_DEVICES='' HF_HUB_OFFLINE=1 OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=1 PYTHONPATH=. .venv/bin/python scripts/diagnostics/witness_er_cpu.py"
+}

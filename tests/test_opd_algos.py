@@ -225,6 +225,30 @@ class TestOPDAdvantage(unittest.TestCase):
         torch.testing.assert_close(weights, expected_weights)
         torch.testing.assert_close(divergence, expected_divergence)
 
+    def test_single_rollout_sod_without_grpo_is_reward_independent(self):
+        mask = torch.tensor([[1, 1, 0, 1, 1, 0]], dtype=torch.long)
+        batch = DataProto.from_dict(tensors={
+            'responses': torch.ones(1, 6, dtype=torch.long),
+            'attention_mask': torch.ones(1, 8, dtype=torch.long),
+            'loss_mask': mask,
+            'old_log_probs': torch.full((1, 6), -3.0),
+            'ref_log_prob': torch.tensor([[-2., -2., -1., -1., -1., -1.]]),
+            'token_level_rewards': torch.zeros(1, 6),
+        }, non_tensors={'uid': np.array(['single_prompt'], dtype=object)})
+        batch.meta_info['opd_config'] = {
+            'advantage_mode': 'token', 'normalize': False, 'clip_value': None,
+            'distillation_coef': .01, 'grpo_reward_coef': 0.,
+            'use_gated_distillation': False,
+            'sod': {'enable': True, 'epsilon': 1e-6, 'delta': .2},
+        }
+        first = compute_advantage(batch, 'opd').batch['advantages'].clone()
+        batch.batch['token_level_rewards'].fill_(100.)
+        second = compute_advantage(batch, 'opd').batch['advantages']
+        torch.testing.assert_close(first, second)
+        self.assertTrue(torch.isfinite(second).all())
+        self.assertGreater(second.abs().sum().item(), 0)
+        torch.testing.assert_close(second * (1-mask), torch.zeros_like(second))
+
     def test_sod_combines_stepwise_opd_with_grpo(self):
         action_mask = torch.tensor([
             [1, 1, 0, 1, 1, 0],

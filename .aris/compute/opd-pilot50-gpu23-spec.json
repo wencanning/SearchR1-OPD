@@ -1,0 +1,38 @@
+{
+  "python": "/data/home/wencanning/miniconda3/envs/searchr1/bin/python",
+  "torch": "2.4.0+cu121",
+  "transformers": "4.47.1",
+  "ray": "2.51.2",
+  "vllm": "0.6.3 patched",
+  "gpus": [
+    2,
+    3
+  ],
+  "gpu_uuids": [
+    "GPU-79f08c8c-6fe7-4ab0-d16f-00ab0dba95df",
+    "GPU-4491c0be-1ea7-eff5-5e5b-9e4fe635f053"
+  ],
+  "cpus": 8,
+  "threads": 4,
+  "teacher": "7BBF16SDPAresident",
+  "student": "0.5Boriginalstep50 FP32params BF16autocast",
+  "vllm_fraction_remaining": 0.45,
+  "tp": 1,
+  "dp": 2,
+  "min_free_mib": null,
+  "max_owned_mib": null,
+  "witness": "Freshagent executes launch/wait_and_start.py in pane%5; CPUwaiting forforeignjobs toleave, then3updatewitness and automatedruntimechecks; no claim of readiness before pass.",
+  "acceptance": "3realordinaryOPDupdates,correctcoef1/0,LR1e-6,finitegradient/loss,changedcheckpoint,groupdiversity,physicalGPU2/3,retrieverpreserved;formal50updates",
+  "global_actor_microbatch": 8,
+  "global_rollout_logprob_microbatch": 8,
+  "global_ref_logprob_microbatch": 8,
+  "per_rank_microbatch": 4,
+  "witness_run": "witness_opd_only_ready",
+  "source": "research_runs/objective_ablation_gpu23_20260920/source_v4",
+  "sampling": "Fixed engine seed; SamplingParams.seed=None; per-update full-group diversity telemetry",
+  "actual_updates_per_run": 50,
+  "arms": [
+    "opd_only",
+    "opd_teacher_recovery"
+  ]
+}

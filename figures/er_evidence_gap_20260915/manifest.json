@@ -1,0 +1,14 @@
+{
+  "source_sha256": {
+    "FINAL_COMPLETED.json": "1172e8658b4d4de1ac5ec8d3c2ed432366e616d135e671525dc4483c4f109ec3",
+    "AUDIT.json": "3af2be938099024083f72d3e3a30eb5ac47040ea281d7ec4004e351c9b63b312",
+    "precision_sensitivity/scores.jsonl": "e35291a50a36212ef3eff7c77d26720202a1e6502a064a13ed73bc1e10b49c7e",
+    "precision_sensitivity/alias_sensitivity.json": "70bdf0a6ec4bdb4ba3dcb4c8cea821e368708d5465704c5c3cce2945bba2b76b"
+  },
+  "matplotlib": "3.11.2",
+  "n_core": 6,
+  "n_historical_pass": 3,
+  "panel_b_post_hoc": true,
+  "no_new_model_inference": true,
+  "plot_script_sha256": "c74d83fc4d44cf9af75f126a89bbd50b25a91ce276fbb629b94a9f05c7e4b2d3"
+}

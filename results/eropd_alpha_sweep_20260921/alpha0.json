@@ -1,0 +1,23 @@
+{
+  "alpha": "0",
+  "model": "verl_checkpoints/opd-grpo-0.5B/actor/global_step_150",
+  "note": "alpha0 is observed OPD baseline.",
+  "metrics": {
+    "nq": 0.33933518005540164,
+    "triviaqa": 0.5101210996199063,
+    "popqa": 0.40800448587649824,
+    "hotpotqa": 0.3096556380823768,
+    "2wikimultihopqa": 0.28967875318066155,
+    "musique": 0.09557302441042614,
+    "bamboogle": 0.232,
+    "Avg": 0.31205259731789586
+  },
+  "checkpoint_step": 150,
+  "status": "completed",
+  "returncode": 0,
+  "validation_batches": 102,
+  "seed": 42,
+  "val_batch_size": 512,
+  "source_result": "eval_loop_logs/eropd_alpha0to2_gpu23_20260921_retry0901/alpha0/completed.json",
+  "source_sha256": "421ee64fc578472d9204717d2c637d4f1be02ec0a2374d274f539d5c4c650a6e"
+}

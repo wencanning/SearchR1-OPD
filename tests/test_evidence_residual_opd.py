@@ -542,6 +542,17 @@ class SODConfigTest(unittest.TestCase):
     def test_released_sod_config_is_accepted(self):
         validate_sod_config(self._config())
 
+    def test_no_grpo_sod_requires_explicit_ablation_opt_in(self):
+        config = self._config()
+        config.algorithm.opd.grpo_reward_coef = 0.0
+        with self.assertRaisesRegex(ValueError, 'positive GRPO'):
+            validate_sod_config(config)
+        config.algorithm.opd.sod.allow_no_grpo_ablation = True
+        validate_sod_config(config)
+        config.algorithm.opd.grpo_reward_coef = -1.0
+        with self.assertRaisesRegex(ValueError, 'positive GRPO'):
+            validate_sod_config(config)
+
     def test_sod_rejects_intervened_teacher_target(self):
         config = self._config()
         config.algorithm.opd.teacher_target = 'evidence_residual'

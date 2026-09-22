@@ -1,0 +1,22 @@
+{
+  "python": "/data/home/wencanning/miniconda3/envs/searchr1/bin/python",
+  "python_version": "3.9.25",
+  "torch": "2.4.0+cu121",
+  "transformers": "4.47.1",
+  "ray": "2.51.2",
+  "vllm": "0.6.3 repository patched installation",
+  "gpu": "GPU-c9944a46-db64-1215-948c-35aae45ebc32",
+  "cuda_visible_devices": "7",
+  "cpus": 8,
+  "threads": 4,
+  "mode": "Evaluation only, no7Bteacher, no critic, no optimizer updates",
+  "dtype": "actorFP32 / vLLMBF16",
+  "max_owned_mib": 12288,
+  "min_free_mib": null,
+  "vllm_cache_fraction_of_remaining": 0.08,
+  "vllm_max_num_seqs": 16,
+  "source": "research_runs/degradation_gpu7_20260920/source",
+  "weights": "Original0.5Bstep50 and9completed continuation checkpoints",
+  "witness": "/data/home/wencanning/miniconda3/envs/searchr1/bin/python research_runs/degradation_gpu7_20260920/launch/run.py --checkpoint initial --panel witness_4 --name witness",
+  "witness_acceptance": "4train-only cases, exact orderedIDs, valid binaryEM, generated-only score crosscheck, unchanged checkpoint, no actor/pg_loss, peak owned<=12GiB"
+}

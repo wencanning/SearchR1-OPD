@@ -1,0 +1,32 @@
+{
+  "source_sha256": {
+    "precision_sensitivity/scores.jsonl": "e35291a50a36212ef3eff7c77d26720202a1e6502a064a13ed73bc1e10b49c7e",
+    "precision_sensitivity/alias_sensitivity.json": "70bdf0a6ec4bdb4ba3dcb4c8cea821e368708d5465704c5c3cce2945bba2b76b"
+  },
+  "script_sha256": "4cea3b384320c0589981a1358628e9cacde96b39c13a8abd4b167fd3f1105a67",
+  "case_labels": {
+    "E017": "诺贝尔奖先后",
+    "E004": "猎犬品种",
+    "E008": "乐队缩写含义",
+    "E002": "活动举办城市",
+    "E003": "两座城市共同点",
+    "E030": "希伯来文字类型"
+  },
+  "case_order": [
+    "E017",
+    "E004",
+    "E008",
+    "E002",
+    "E003",
+    "E030"
+  ],
+  "panel_b_full_answer_margins": {
+    "hidden": -3.179497465491295,
+    "observed": -0.6347692310810089,
+    "er_1": 1.9096316397190094,
+    "entropy_matched": -1.9065044969320297
+  },
+  "n": 6,
+  "new_inference": false,
+  "scope": "readability redesign; unchanged audited data"
+}

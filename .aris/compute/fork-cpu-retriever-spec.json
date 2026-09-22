@@ -1,0 +1,10 @@
+{
+  "base": "Existing /data/home/wencanning/miniconda3/envs/retriever; no installations",
+  "device": "CPU only, CUDA_VISIBLE_DEVICES empty",
+  "cpus": 4,
+  "memory_budget_gib": 90,
+  "encoder": "intfloat/e5-base-v2 local snapshot f52bf8ec8c7124536f0efb74aca902b2995e5bcd, float32 mean pooling, query prefix, max_length256",
+  "index": "data/retriever_root/wiki18/e5_Flat.index original CPU FAISS, topk3",
+  "corpus": "data/retriever_root/wiki18/wiki-18.jsonl",
+  "witness": "CUDA_VISIBLE_DEVICES='' HF_HUB_OFFLINE=1 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=1 nice -n 10 /data/home/wencanning/miniconda3/envs/retriever/bin/python scripts/experiments/er_next/cpu_retriever.py --out reports/er_next_20260916/cpu_retriever_witness --witness-only"
+}

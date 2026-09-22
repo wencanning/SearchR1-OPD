@@ -1,0 +1,10 @@
+{
+  "base": "existing .venv Python 3.12.13; no installs or package changes",
+  "packages": {"torch": "2.4.0+cu121", "transformers": "4.47.1"},
+  "tier": {"cpus": 4, "memory_gib_estimate": 45, "gpus": 0},
+  "env": {"CUDA_VISIBLE_DEVICES": "", "HF_HUB_OFFLINE": "1", "OMP_NUM_THREADS": "4", "MKL_NUM_THREADS": "4", "OPENBLAS_NUM_THREADS": "1"},
+  "student": {"device": "cpu", "dtype": "float32", "attention": "eager", "generation_cache": true},
+  "teacher": {"device": "cpu", "dtype": "float32", "attention": "eager", "use_cache": false},
+  "witness": "CUDA_VISIBLE_DEVICES='' HF_HUB_OFFLINE=1 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=1 .venv/bin/python scripts/experiments/evidence_cpu_followup/witness.py",
+  "teacher_witness": "reports/er_correction_cpu_20260914/ENV_WITNESS.md"
+}
