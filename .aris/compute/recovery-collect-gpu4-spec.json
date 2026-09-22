@@ -1,0 +1,18 @@
+{
+  "base": "existing repository .venv Python3.12; no installs",
+  "torch": "2.4.0+cu121",
+  "transformers": "4.47.1",
+  "gpu": "physical GPU4 UUID GPU-209eafd7-38f5-a04a-12d5-8d316ea4f8a8",
+  "cpus": 4,
+  "dtype": "bfloat16",
+  "attention": "sdpa",
+  "allocator_limit_gib": 8,
+  "own_stop_gib": 10,
+  "minimum_free_gib": 16,
+  "startup_free_gib": 24,
+  "models": [
+    "verl_checkpoints/opd-grpo-0.5B/actor/global_step_50"
+  ],
+  "witness": "scripts/experiments/recovery_collect_gpu4_20260917/probe.py --model student --witness",
+  "training": false
+}

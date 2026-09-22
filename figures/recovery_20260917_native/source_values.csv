@@ -1,0 +1,11 @@
+panel,label,correct,n,percent,low,high
+(a) Testing the original explanation,Original context,12,32,37.5,12.5,62.5
+(a) Testing the original explanation,Last reasoning removed,13,32,40.625,18.75,62.5
+(a) Testing the original explanation,Annotated support*,23,32,71.875,50.0,90.625
+(b) Do recovery paths exist?,All tested states,16,16,100.0,,
+(b) Do recovery paths exist?,Student failed both attempts,11,16,68.75,,
+(b) Do recovery paths exist?,Teacher recovered,4,16,25.0,,
+(c) Do students learn from them?,Before update,2,16,12.5,0.0,31.25
+(c) Do students learn from them?,Local OPD update,2,16,12.5,0.0,31.25
+(c) Do students learn from them?,+ Student replay,4,16,25.0,6.25,50.0
+(c) Do students learn from them?,+ Teacher recovery,4,16,25.0,6.25,50.0

@@ -1,0 +1,19 @@
+{
+  "base": "existing repository .venv Python3.12; no installs",
+  "torch": "2.4.0+cu121",
+  "transformers": "4.47.1",
+  "gpu": "physical GPU4 UUID GPU-209eafd7-38f5-a04a-12d5-8d316ea4f8a8",
+  "cpus": 4,
+  "dtype": "bfloat16",
+  "attention": "sdpa",
+  "allocator_limit_gib": 20,
+  "own_stop_gib": 22,
+  "minimum_free_gib": 16,
+  "startup_free_gib": 34,
+  "models": [
+    "verl_checkpoints/opd-grpo-0.5B/actor/global_step_50",
+    "/data/home/wencanning/models/SearchR1-nq_hotpotqa_train-qwen2.5-7b-it-em-grpo-v0.3"
+  ],
+  "witness": "scripts/experiments/recovery_teacher_start_gpu4_20260917/probe.py --model teacher --witness",
+  "training": false
+}

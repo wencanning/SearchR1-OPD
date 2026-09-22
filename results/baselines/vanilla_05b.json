@@ -1,0 +1,15 @@
+{
+  "model": "/data/home/wencanning/models/Qwen2.5-0.5B-Ins",
+  "metrics": {
+    "nq": 0.0008310249307479224,
+    "triviaqa": 0.0033589675594448863,
+    "popqa": 0.002383121889675475,
+    "hotpotqa": 0.0031060094530722484,
+    "2wikimultihopqa": 0.008428753180661578,
+    "musique": 0.0,
+    "bamboogle": 0.0,
+    "Avg": 0.00258683957337173
+  },
+  "source_result": "eval_loop_logs/vanilla_instruct_students_gpu2_20260917_192712_79820/0.5B/completed.json",
+  "source_sha256": "eeed1fba6c91c283ef1a5bd129a8bc7ce2eea4075d1e4ba7c162cafd5b89f563"
+}

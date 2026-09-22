@@ -21,6 +21,7 @@ from verl.utils.reward_score import qa_em
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 import re
 import numpy as np
+import os
 
 def _select_rm_score_fn(data_source):
     if data_source in ['nq', 'triviaqa', 'popqa', 'hotpotqa', '2wikimultihopqa', 'musique', 'bamboogle']:
@@ -105,9 +106,14 @@ import hydra
 def main(config):
     if not ray.is_initialized():
         # this is for local ray cluster
+        local_ray_options = {}
+        if os.environ.get('SEARCHR1_RAY_CPUS'):
+            local_ray_options.update(num_cpus=int(os.environ['SEARCHR1_RAY_CPUS']),
+                                     include_dashboard=False, object_store_memory=4 * 1024**3)
         ray.init(
             address='local',
             runtime_env={'env_vars': {'TOKENIZERS_PARALLELISM': 'true', 'NCCL_DEBUG': 'WARN'}},
+            **local_ray_options,
         )
 
     ray.get(main_task.remote(config))

@@ -129,3 +129,16 @@ verl_checkpoints/
 
 reports/
 
+
+# Local experiment workspaces and orchestration state (keep on disk)
+/research_runs/
+/MANIFEST.md
+/.aris/external/
+/.aris/meta/
+/.aris/traces/
+/.aris/*.lock
+/.env
+/.env.*
+!.env.example
+*.safetensors
+*.bin

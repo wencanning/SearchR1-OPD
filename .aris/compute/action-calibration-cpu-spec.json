@@ -1,0 +1,34 @@
+{
+  "base": "existing .venv Python3.12; no package installation",
+  "packages": {
+    "torch": "2.4.0+cu121",
+    "transformers": "4.47.1"
+  },
+  "tier": {
+    "cpus": 4,
+    "memory_gib_estimate": 65,
+    "gpus": 0
+  },
+  "env": {
+    "CUDA_VISIBLE_DEVICES": "",
+    "HF_HUB_OFFLINE": "1",
+    "OMP_NUM_THREADS": "4",
+    "MKL_NUM_THREADS": "4",
+    "OPENBLAS_NUM_THREADS": "1"
+  },
+  "student": {
+    "device": "cpu",
+    "dtype": "float32",
+    "attention": "eager",
+    "generation_cache": true,
+    "backward": true,
+    "optimizer": "fresh AdamW lr1e-6; sequential arms; no checkpoint writes"
+  },
+  "teacher": {
+    "device": "cpu",
+    "dtype": "float32",
+    "attention": "eager",
+    "use_cache": false
+  },
+  "witness": "CUDA_VISIBLE_DEVICES='' HF_HUB_OFFLINE=1 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=1 PYTHONPATH=. .venv/bin/python scripts/experiments/action_calibration_cpu/witness.py"
+}

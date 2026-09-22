@@ -1,0 +1,23 @@
+{
+  "alpha": "1.5",
+  "model": "verl_checkpoints/eropd-grpo-05B-test-alpha15/actor/global_step_100",
+  "note": "",
+  "metrics": {
+    "nq": 0.32936288088642657,
+    "triviaqa": 0.4990718642269955,
+    "popqa": 0.40800448587649824,
+    "hotpotqa": 0.29574611748818364,
+    "2wikimultihopqa": 0.25962150127226463,
+    "musique": 0.07860984691766652,
+    "bamboogle": 0.16,
+    "Avg": 0.2900595280954336
+  },
+  "checkpoint_step": 100,
+  "status": "completed",
+  "returncode": 0,
+  "validation_batches": 102,
+  "seed": 42,
+  "val_batch_size": 512,
+  "source_result": "eval_loop_logs/eropd_alpha0to2_gpu23_20260921_retry0901/alpha1.5/completed.json",
+  "source_sha256": "433ddb103fbd8f5b9582fd7ace2ef3558cdad9e6d756921df6af460c523db033"
+}

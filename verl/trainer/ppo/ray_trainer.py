@@ -685,7 +685,9 @@ def validate_sod_config(config):
         raise ValueError('SOD requires normalize=false')
     if opd_config.clip_value is not None:
         raise ValueError('SOD requires clip_value=null')
-    if float(opd_config.get('grpo_reward_coef', 0.0)) <= 0:
+    reward_coef = float(opd_config.get('grpo_reward_coef', 0.0))
+    no_grpo_ablation = sod_config.get('allow_no_grpo_ablation', False)
+    if reward_coef < 0 or (reward_coef == 0 and not no_grpo_ablation):
         raise ValueError('the released SOD baseline requires a positive GRPO reward coefficient')
     if opd_config.get('use_gated_distillation', False):
         raise ValueError('SOD step-wise weighting replaces the legacy sigmoid gate')
@@ -941,6 +943,8 @@ class RayPPOTrainer(object):
         self.train_dataloader = DataLoader(dataset=self.train_dataset,
                                            batch_size=self.config.data.train_batch_size,
                                            shuffle=self.config.data.shuffle_train_dataloader,
+                                           generator=(torch.Generator().manual_seed(int(self.config.data.train_seed))
+                                                      if self.config.data.get('train_seed') is not None else None),
                                            drop_last=True,
                                            collate_fn=collate_fn)
 

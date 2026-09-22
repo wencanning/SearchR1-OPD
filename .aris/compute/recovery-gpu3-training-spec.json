@@ -1,0 +1,20 @@
+{
+  "base": "existing repository .venv Python3.12; no installs",
+  "torch": "2.4.0+cu121",
+  "transformers": "4.47.1",
+  "gpu": "physical GPU3 UUID GPU-4491c0be-1ea7-eff5-5e5b-9e4fe635f053",
+  "cpus": 4,
+  "dtype": "FP32 student parameters/Adam, BF16 autocast SDPA",
+  "attention": "sdpa",
+  "allocator_limit_gib": 24,
+  "own_stop_gib": 26,
+  "minimum_free_gib": 16,
+  "startup_free_gib": 32,
+  "models": [
+    "verl_checkpoints/opd-grpo-0.5B/actor/global_step_50"
+  ],
+  "witness": "scripts/experiments/recovery_20260917/local_update.py --witness",
+  "training": true,
+  "optimizer": "AdamW lr1e-6 betas0.9/0.999 eps1e-8 weight_decay0 foreachFalse",
+  "gradient_checkpointing": true
+}

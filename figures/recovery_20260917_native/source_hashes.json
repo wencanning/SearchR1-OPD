@@ -1,0 +1,9 @@
+{
+  "reports/recovery_20260917/probe_teacher/answers.jsonl": "d0116420e61fc3cc6f0cf712eae70bd02fc8eb6b0f55ecfd949c611799788640",
+  "reports/recovery_20260917_native/recovery_summary.json": "fd9a03d73f3c42b75c738997b5603bd25f0e40659f17d85966476c9a129c277c",
+  "reports/recovery_20260917_native/update_summary.json": "9d96daec8fa6fefed1c9d3cedf2e1787db014dd946260ce1a3fdc0a977a62795",
+  "reports/recovery_20260917_native/continue_student/continuations.jsonl": "06cf97ca9e9b7f097aa90a8cd5abc99eb71e1019bd986146e93554127df2725e",
+  "reports/recovery_20260917_native/eval_base/continuations.jsonl": "f434a10f06ac709b337280190411c7b446494036c3eca5ca643b4b2fd4c6ec2e",
+  "reports/recovery_20260917_native/eval_student_replay/continuations.jsonl": "830647380a2ef59d742dc90ff623a30051d21c2ec573ea837b8680c7172c17b4",
+  "reports/recovery_20260917_native/eval_teacher_repair/continuations.jsonl": "4f95a0a2501a8506152cff3e81aa1ba9d1222fdd931855df1c4f92437d972dd8"
+}

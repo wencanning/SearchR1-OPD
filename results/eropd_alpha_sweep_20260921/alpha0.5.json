@@ -1,0 +1,23 @@
+{
+  "alpha": "0.5",
+  "model": "verl_checkpoints/eropd-alpha05-from-6bpwblvv-step50-20260912_164223/actor/global_step_150",
+  "note": "",
+  "metrics": {
+    "nq": 0.3337950138504155,
+    "triviaqa": 0.5060549809953151,
+    "popqa": 0.4028176911754398,
+    "hotpotqa": 0.3151924375422012,
+    "2wikimultihopqa": 0.2806138676844784,
+    "musique": 0.08936698386429458,
+    "bamboogle": 0.232,
+    "Avg": 0.3085487107303064
+  },
+  "checkpoint_step": 150,
+  "status": "completed",
+  "returncode": 0,
+  "validation_batches": 102,
+  "seed": 42,
+  "val_batch_size": 512,
+  "source_result": "eval_loop_logs/eropd_alpha0to2_gpu23_20260921_retry0901/alpha0.5/completed.json",
+  "source_sha256": "5466ef6049fc0648f6828a29b015d069074cf856d483e9c4b7bcf55f722e0aab"
+}

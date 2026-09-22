@@ -1,0 +1,15 @@
+{
+  "model": "verl_checkpoints/sod-grpo-0.5B/actor/global_step_150",
+  "metrics": {
+    "nq": 0.33573407202216066,
+    "triviaqa": 0.5089719791390436,
+    "popqa": 0.41977991168430645,
+    "hotpotqa": 0.3162727886563133,
+    "2wikimultihopqa": 0.2926208651399491,
+    "musique": 0.09557302441042614,
+    "bamboogle": 0.272,
+    "Avg": 0.32013609157888556
+  },
+  "source_result": "eval_loop_logs/sod_05b_step150_gpu2_20260917_133247_3011937/completed.json",
+  "source_sha256": "2920d7e1415ce3361e288cca3c80c24f9831fad7e7acab9f29ee2d370e7e0a7b"
+}
